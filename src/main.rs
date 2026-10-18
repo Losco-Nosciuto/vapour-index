@@ -1,13 +1,16 @@
-﻿//! The producer: enumerate Valve's master list, filter the flood, publish an artifact.
+//! The producer: enumerate Valve's master list, filter the flood, publish an artifact.
 //!
-//! Runs in two modes and needs no configuration in the common case:
+//! Two ways to read the master list, picked by the environment:
 //!
-//! - `STEAM_API_KEY` in the environment â†’ straight to Valve, parallel, ~2 minutes. What Actions does.
-//! - otherwise â†’ through the relay (`VAPOUR_RELAY`, defaulting to ours), sequential and paced, so a
-//!   local run never needs the key.
+//! - `STEAM_API_KEY` set: straight to Valve, parallel. A complete sweep is a few minutes.
+//! - otherwise: through the relay (`VAPOUR_RELAY`, defaulting to ours), which holds the key, so a
+//!   local run never needs one.
+//!
+//! A page of 10,000 rows costs roughly 3.3 seconds from Valve, so what decides how long a sweep takes
+//! is the number of buckets the distribution produces, not the number of servers in it.
 //!
 //! ```text
-//! cargo run -p vapour-crawler -- --out servers.json.gz
+//! cargo run -- --out servers.json.gz
 //! ```
 
 mod cluster;
@@ -45,10 +48,13 @@ struct SweepStats {
     requests: usize,
     failed: usize,
     unresolved: usize,
-    /// Empty answers on the first attempt â€” the signature of Valve throttling a busy client.
+    /// Empty answers on the first attempt, and buckets still empty after retrying.
     empty_first: usize,
-    /// Queries that were still empty after retrying: either a genuinely empty bucket or a real miss.
     empty_stubborn: usize,
+    /// Queries Valve throttled into a failure, and queries that only succeeded on a retry or in the
+    /// patient second pass. A sweep with any `failed` left is a lower bound, and says so.
+    throttled: usize,
+    recovered: usize,
     maps: usize,
     /// True when every query completed and no bucket was left at the cap.
     complete: bool,
@@ -278,6 +284,8 @@ async fn main() {
                 unresolved: found.unresolved,
                 empty_first: found.empty_first,
                 empty_stubborn: found.empty_stubborn,
+                throttled: found.throttled,
+                recovered: found.recovered,
                 maps: found.maps.len(),
                 complete: found.complete(),
             },
@@ -390,8 +398,8 @@ fn report(found: &Enumerated, thresholds: cluster::Thresholds) {
     );
     println!("complete   : {}", found.complete());
     println!(
-        "empty pages: {} first attempt, {} still empty after retries",
-        found.empty_first, found.empty_stubborn
+        "pages      : {} throttled, {} recovered on retry, {} empty, {} empty after retries",
+        found.throttled, found.recovered, found.empty_first, found.empty_stubborn
     );
     println!("maps       : {}", found.maps.len());
     println!("listings   : {}", found.servers.len());

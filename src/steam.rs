@@ -66,10 +66,25 @@ pub const NAME_BUCKETS: &[&str] = &[
     ";", "?", "@", "^", ">", " ",
 ];
 
-/// Valve's master server answers with an empty list rather than an error when it is asked for too
-/// much at once, so an empty answer is worth doubting before it is believed.
-const EMPTY_ATTEMPTS: usize = 3;
+/// Valve's master server answers with no `servers` key at all rather than an error when it is asked
+/// for too much at once, so a missing answer is worth retrying before it is believed.
+const EMPTY_ATTEMPTS: usize = 4;
 const EMPTY_BACKOFF_MS: u64 = 400;
+
+/// Rounds of patient, one-at-a-time recovery for buckets Valve throttled, and the pause per round.
+const STRAGGLER_ROUNDS: usize = 3;
+const STRAGGLER_PAUSE_MS: u64 = 400;
+
+/// The producer's token, when it has one.
+///
+/// It signs reads to the relay so the relay can tell our own sweep from a stranger's requests, and it
+/// is part of the cache key busting that makes a retry different from the attempt it is retrying.
+fn producer_token() -> Option<String> {
+    std::env::var("VAPOUR_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
 
 /// How deep a name prefix may be subdivided before a saturated bucket is reported rather than split.
 const MAX_NAME_DEPTH: usize = 6;
@@ -96,28 +111,34 @@ impl Transport {
         }
     }
 
-    /// Delay between request *starts*. The relay allows 120/minute and counts cache hits, so pacing
-    /// is mandatory there; against Valve directly there is no such limit.
+    /// Delay between request *starts*.
+    ///
+    /// The relay rate-limits a stranger to 120 a minute and counts cache hits, so pacing is mandatory
+    /// there. Our own sweep signs its reads with the producer token and is allowed far more, so it has
+    /// no reason to pace itself into a twenty-minute sweep.
     fn pace(&self) -> Duration {
         match self {
             Transport::Direct(_) => Duration::ZERO,
-            Transport::Relay(_) => Duration::from_millis(550),
+            Transport::Relay(_) => match producer_token() {
+                Some(_) => Duration::ZERO,
+                None => Duration::from_millis(550),
+            },
         }
     }
 
     fn concurrency(&self) -> usize {
         match self {
-            // Measured 18/10/2026 against Valve, sixteen queries at a time on one bucket:
+            // Measured 18-19/10/2026 against Valve.
             //
-            //   concurrency  2:  0/6 empty     concurrency  4:  0/12 empty
-            //   concurrency  8: 10/24 empty    concurrency 16:  6/16 empty
+            // Sixteen *identical* queries at once (one bucket): 6/16 came back throttled. Sixteen
+            // *distinct* buckets at once: 81k rows in one 3.4 s wall-clock, ~6/16 throttled. So the
+            // throttling is about pressure, not about duplicate filters, and a real page costs ~3.3 s
+            // no matter how many rows it holds.
             //
-            // Above four, Valve starts answering HTTP 200 with **an empty server list** in about
-            // 350 ms, against ~3 s for a full page. That is not an error, it does not trip the row
-            // cap, and so a saturated bucket gets recorded as empty and never subdivided — a
-            // silently truncated sweep that reports itself complete. Four is the measured safe rate.
-            Transport::Direct(_) => 4,
-            Transport::Relay(_) => 1,
+            // Eight keeps most of that speed with few enough stragglers for the second pass to clean
+            // up, and a sweep only costs as many pages as the distribution demands.
+            Transport::Direct(_) => 8,
+            Transport::Relay(_) => 8,
         }
     }
 
@@ -164,6 +185,9 @@ pub struct Enumerated {
     /// Queries whose first attempt came back empty, and queries that never filled after retrying.
     pub empty_first: usize,
     pub empty_stubborn: usize,
+    /// Queries Valve throttled into a failure, and queries that only succeeded on a retry.
+    pub throttled: usize,
+    pub recovered: usize,
     /// Map values harvested from the first pass.
     pub maps: Vec<String>,
     /// Addresses already collected, so deduplication stays O(1) instead of rescanning every row.
@@ -184,6 +208,23 @@ pub struct Sweep<'a> {
     /// Queries whose first attempt came back empty, and queries that never filled after retrying.
     empty_first: std::sync::atomic::AtomicUsize,
     empty_stubborn: std::sync::atomic::AtomicUsize,
+    /// Queries Valve throttled, and queries that only succeeded on a retry.
+    throttled: std::sync::atomic::AtomicUsize,
+    recovered: std::sync::atomic::AtomicUsize,
+}
+
+/// One attempt at one query.
+#[derive(Debug)]
+enum Attempt {
+    /// A real answer. It may hold zero servers, and that is a fact about the master list.
+    Rows(Vec<GameServer>),
+    /// HTTP 200 with **no `servers` key at all**.
+    ///
+    /// Not an answer. Valve does this when it is asked for too much at once, and it is recognisable by
+    /// its speed: ~400 ms, against ~3 s for a real page. Reading it as "empty" is how a sweep reports
+    /// itself complete while having read nothing — an empty bucket never trips the row cap, so it is
+    /// never subdivided, and the loss is silent.
+    Throttled,
 }
 
 impl<'a> Sweep<'a> {
@@ -196,31 +237,43 @@ impl<'a> Sweep<'a> {
         Ok(Self {
             transport,
             limit: MASTER_ROW_CAP as u32,
-            // A ceiling, not a budget: a full sweep needs every `prefix x map` pair, and the real
-            // limit is when no bucket is still capped. Valve allows ~100k calls a day, and the work
-            // is one page of queries either way.
+            // A ceiling, not a budget: a full sweep needs every bucket the distribution produces, and
+            // the real limit is when none is still capped. Valve allows ~100k calls a day.
             max_requests: 12_000,
             client,
             empty_first: std::sync::atomic::AtomicUsize::new(0),
             empty_stubborn: std::sync::atomic::AtomicUsize::new(0),
+            throttled: std::sync::atomic::AtomicUsize::new(0),
+            recovered: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
-    pub fn empty_stats(&self) -> (usize, usize) {
+    pub fn stats(&self) -> (usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
         (
-            self.empty_first.load(std::sync::atomic::Ordering::Relaxed),
-            self.empty_stubborn.load(std::sync::atomic::Ordering::Relaxed),
+            self.empty_first.load(Relaxed),
+            self.empty_stubborn.load(Relaxed),
+            self.throttled.load(Relaxed),
+            self.recovered.load(Relaxed),
         )
     }
 
-    async fn fetch_once(&self, filter: &str) -> Result<Vec<GameServer>, String> {
-        let url = self.transport.url(filter, self.limit);
+    /// One request. `limit` is explicit so a retry can differ from the attempt that failed — a retry
+    /// that sends the identical request can be answered from a cache, which is how a "retry" ends up
+    /// reading the same nothing twice.
+    async fn fetch_once(&self, filter: &str, limit: u32) -> Result<Attempt, String> {
+        let url = self.transport.url(filter, limit);
         // Never log the URL in direct mode: it carries the key.
         let shown = if url.contains("key=") { "<direct, key redacted>" } else { url.as_str() };
 
-        let response = self
-            .client
-            .get(&url)
+        let mut request = self.client.get(&url);
+        // Only the relay needs to recognise us: the token lets it give our own sweep a rate limit a
+        // complete sweep can live with. It is never sent to Valve.
+        if let (Transport::Relay(_), Some(token)) = (self.transport, producer_token()) {
+            request = request.header("x-vapour-token", token);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| format!("{shown}: {e}"))?;
@@ -230,35 +283,59 @@ impl<'a> Sweep<'a> {
             let snippet: String = body.chars().take(160).collect();
             return Err(format!("{shown}: HTTP {status}: {snippet}"));
         }
-        let envelope: Envelope = response
-            .json()
-            .await
-            .map_err(|e| format!("{shown}: {e}"))?;
-        Ok(envelope.response.and_then(|b| b.servers).unwrap_or_default())
+
+        // Parsed as a value first: the difference between *no* `servers` key and an *empty* one is the
+        // whole point, and a typed `Option<Vec<_>>` erases it.
+        let body: serde_json::Value = response.json().await.map_err(|e| format!("{shown}: {e}"))?;
+        match body.get("response").and_then(|r| r.get("servers")) {
+            Some(serde_json::Value::Array(_)) => {
+                let envelope: Envelope = serde_json::from_value(body)
+                    .map_err(|e| format!("{shown}: unexpected shape: {e}"))?;
+                Ok(Attempt::Rows(
+                    envelope.response.and_then(|b| b.servers).unwrap_or_default(),
+                ))
+            }
+            _ => Ok(Attempt::Throttled),
+        }
     }
 
-    /// One filter, with an empty answer retried.
+    /// One filter, retried properly if Valve throttled it.
     ///
-    /// An empty page is *usually* a lie: it is how Valve reports "too many queries at once", and it
-    /// arrives fast. Retrying is what makes an empty answer mean anything. A bucket that is genuinely
-    /// empty still ends empty — but now that is a fact about the master list rather than about how
-    /// busy we were, and the count of stubborn empties is reported instead of assumed away.
+    /// Every attempt varies the row limit, which is part of the relay's cache key — otherwise a retry
+    /// is answered from the cache entry written by the attempt that just failed.
     async fn fetch(&self, filter: &str) -> Result<Vec<GameServer>, String> {
-        for attempt in 1..=EMPTY_ATTEMPTS {
-            let rows = self.fetch_once(filter).await?;
-            if !rows.is_empty() {
-                return Ok(rows);
-            }
-            if attempt == 1 {
-                self.empty_first.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            if attempt < EMPTY_ATTEMPTS {
-                let backoff = EMPTY_BACKOFF_MS * (1 << (attempt - 1));
-                tokio::time::sleep(Duration::from_millis(backoff)).await;
+        for attempt in 0..EMPTY_ATTEMPTS {
+            let limit = self.limit.saturating_sub(attempt as u32);
+            match self.fetch_once(filter, limit).await? {
+                Attempt::Rows(rows) => {
+                    if attempt > 0 {
+                        self.recovered
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if rows.is_empty() {
+                        self.empty_first
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if attempt + 1 == EMPTY_ATTEMPTS {
+                            self.empty_stubborn
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    return Ok(rows);
+                }
+                Attempt::Throttled => {
+                    if attempt + 1 == EMPTY_ATTEMPTS {
+                        self.throttled
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Reported as a failure, never as an empty list: a bucket we could not read
+                        // must not look like a bucket that holds nothing.
+                        return Err(format!("{filter}: throttled on every attempt"));
+                    }
+                    let backoff = EMPTY_BACKOFF_MS * (1 << attempt);
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                }
             }
         }
-        self.empty_stubborn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Vec::new())
+        unreachable!("the loop returns on the last attempt")
     }
 
     /// Fetch a batch of filters, honouring pacing and bounded concurrency.
@@ -309,6 +386,7 @@ impl<'a> Sweep<'a> {
 
         let mut level: Vec<String> = NAME_BUCKETS.iter().map(|p| (*p).to_string()).collect();
         let mut depth = 1;
+        let mut stragglers: Vec<String> = Vec::new();
 
         while !level.is_empty() {
             let filters: Vec<String> = level
@@ -328,7 +406,10 @@ impl<'a> Sweep<'a> {
                     .to_string();
 
                 match rows {
-                    None => result.failed += 1,
+                    None => {
+                        result.failed += 1;
+                        stragglers.push(filter);
+                    }
                     Some(rows) => {
                         if rows.len() >= MASTER_ROW_CAP {
                             if depth < MAX_NAME_DEPTH {
@@ -357,6 +438,38 @@ impl<'a> Sweep<'a> {
             depth += 1;
         }
 
+        // Recovery rounds over whatever failed: throttling is caused by asking for too much at once,
+        // so the retry that works is the patient one. One query at a time, a pause growing with each
+        // round, and a bounded number of rounds. Anything still unread at the end stays counted as a
+        // failure, which is what makes the sweep report itself a lower bound instead of a complete
+        // list — the difference between a number and a lie.
+        for round in 0..STRAGGLER_ROUNDS {
+            if stragglers.is_empty() {
+                break;
+            }
+            let mut still_failing = Vec::new();
+            for filter in stragglers.drain(..) {
+                let pause = STRAGGLER_PAUSE_MS * (round as u64 + 1);
+                tokio::time::sleep(Duration::from_millis(pause)).await;
+
+                match self.fetch_once(&filter, self.limit - 1 - round as u32).await {
+                    Ok(Attempt::Rows(rows)) => {
+                        result.failed = result.failed.saturating_sub(1);
+                        self.recovered
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if rows.len() >= MASTER_ROW_CAP {
+                            // Recovered, but still full: honest about what was not resolved.
+                            result.unresolved += 1;
+                        }
+                        collect(&mut result, rows);
+                    }
+                    _ => still_failing.push(filter),
+                }
+            }
+            stragglers = still_failing;
+        }
+        result.failed = stragglers.len();
+
         // The map values the sweep revealed, for the report and the artifact.
         let mut maps: Vec<String> = result
             .servers
@@ -368,9 +481,11 @@ impl<'a> Sweep<'a> {
         maps.dedup();
         result.maps = maps;
 
-        let (empty_first, empty_stubborn) = self.empty_stats();
+        let (empty_first, empty_stubborn, throttled, recovered) = self.stats();
         result.empty_first = empty_first;
         result.empty_stubborn = empty_stubborn;
+        result.throttled = throttled;
+        result.recovered = recovered;
 
         Ok(result)
     }
