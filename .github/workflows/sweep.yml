@@ -19,8 +19,14 @@ name: sweep
 
 on:
   schedule:
-    # :17 rather than :00: GitHub delays runs scheduled on the hour, when everyone's cron fires.
-    - cron: "17 * * * *"
+    # Every twelve hours, not hourly.
+    #
+    # Hourly was defensible on paper — the directory changes slowly, and minutes are free on a public
+    # repository. What it ignored is that Valve throttles *us* rather than the request: six runs in one
+    # evening took a key from "sixteen concurrent reads" to 89% of attempts refused, and each further
+    # run extended it. Twelve hours is a directory that still moves faster than servers are added, and
+    # it leaves the key alone in between.
+    - cron: "17 */12 * * *"
   workflow_dispatch:
     inputs:
       max_requests:
