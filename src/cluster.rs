@@ -88,8 +88,6 @@ pub enum Verdict {
 pub enum ReasonKind {
     /// More slots than the engine allows, or more players than slots.
     Arithmetic,
-    /// One address publishing MEGA_HOST_LISTINGS or more.
-    MegaHost,
     /// Several servers on one address — badged, never hidden.
     SeveralOnOneAddress,
     /// Nothing unexplained.
@@ -100,7 +98,6 @@ impl ReasonKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Arithmetic => "arithmetic",
-            Self::MegaHost => "mega-host",
             Self::SeveralOnOneAddress => "several-on-one-address",
             Self::None => "none",
         }
@@ -208,13 +205,14 @@ impl ClusterIndex {
     pub fn assess(&self, server: &GameServer) -> Assessment {
         let thresholds = self.thresholds;
 
-        // ---- arithmetic: the engine cannot do this. Published anyway, badged. -----------------
+        // ---- arithmetic: the engine cannot do this. Hard rule, hidden without remorse. ---------
         //
-        // Deleting was the old behaviour and it was wrong twice over: impossible is not the same as
-        // worthless, and a filter that erases what it disapproves of is the thing this project exists
-        // to replace. The claim is still recorded, in the badge and in the artifact.
+        // A DayZ server cannot host 255 players. This is a fact about the engine rather than an
+        // opinion about the host, so the row goes: no badge, no pardon, and it is the only judgement
+        // that removes anything.
         if server.max_players > thresholds.engine_max_slots {
-            return Assessment::badge(
+            return Assessment::hide_with(
+                Verdict::Impossible,
                 ReasonKind::Arithmetic,
                 format!(
                     "advertises {} slots; the engine caps at {}",
@@ -223,7 +221,8 @@ impl ClusterIndex {
             );
         }
         if server.max_players > 0 && server.players > server.max_players {
-            return Assessment::badge(
+            return Assessment::hide_with(
+                Verdict::Impossible,
                 ReasonKind::Arithmetic,
                 format!("claims {} players in {} slots", server.players, server.max_players),
             );
@@ -233,21 +232,21 @@ impl ClusterIndex {
             return Assessment::clean();
         };
 
-        // ---- a single address publishing an implausible number of listings ---------------------
-        if profile.listings >= thresholds.mega_host_listings {
-            return Assessment::hide_with(
-                Verdict::Suspected,
-                ReasonKind::MegaHost,
-                format!("host publishes {} listings on one address", profile.listings),
-            );
-        }
+        // ---- bulk: collapsed, not condemned ----------------------------------------------------
+        //
+        // A machine announcing two thousand listings is the pollution that makes a list unusable, but
+        // it is not evidence that any particular one of those servers is fake. So the bulk is not
+        // hidden here — it is collapsed by [`deduplicate`], one entry per machine and name. A farm
+        // republishing fifty names on two thousand ports becomes fifty entries; a community running
+        // fifty differently-named servers on one box is untouched. Nothing is erased either way, and
+        // no threshold has to guess which of the two it is looking at.
 
-        // No third test. A rule that hid hosts whose names appeared on other addresses was tried,
+        // No further test. A rule that hid hosts whose names appeared on other addresses was tried,
         // measured, and removed: it deleted 565 real multi-server communities, because spreading
         // servers across a hosting block puts every name on more than one address. See the module
-        // docs. What survives here is arithmetic — a claim the engine cannot honour — and bulk.
+        // docs. Arithmetic is now the only thing that removes a row.
 
-        // ---- several servers on one address: visible, badged, never hidden --------------------
+        // ---- several servers on one address: visible, badged -----------------------------------
         if profile.listings > 5 {
             return Assessment::badge(
                 ReasonKind::SeveralOnOneAddress,
@@ -260,6 +259,15 @@ impl ClusterIndex {
 
         Assessment::clean()
     }
+}
+
+/// The identity of a server for the purposes of collapsing bulk duplication: its machine and its name.
+///
+/// One machine announcing the same name on two thousand ports is one server with a lot of noise, not
+/// two thousand servers. Collapsing on this key removes the noise without deciding that any name is
+/// fake — which is the point, because nowhere in this file is there a rule that erases a name.
+pub fn dedup_key(server: &GameServer) -> (String, String) {
+    (ip_of(&server.addr).to_string(), server.name.trim().to_string())
 }
 
 #[cfg(test)]
@@ -294,27 +302,27 @@ mod tests {
     }
 
     #[test]
-    fn an_impossible_slot_count_is_badged_but_still_published() {
-        // Deleting it was the old behaviour. Impossible is a claim to record, not a licence to erase:
-        // the server ships with the badge, and the client decides what to do about it.
+    fn an_impossible_slot_count_is_hidden_without_remorse() {
+        // A hard fact about the engine, not an opinion about the host. DayZ cannot host 255 players, so
+        // the row goes — and this is the only judgement in the filter that removes anything.
         let mut s = server("1.1.1.1:2303", "Liars");
         s.max_players = 200;
         let index = ClusterIndex::build(std::slice::from_ref(&s), thresholds());
         let a = index.assess(&s);
-        assert!(!a.hide, "an impossible claim must not remove a server from the list");
+        assert!(a.hide);
+        assert_eq!(a.verdict, Verdict::Impossible);
         assert_eq!(a.kind, ReasonKind::Arithmetic);
-        assert_eq!(a.verdict, Verdict::Suspected);
         assert!(a.reasons[0].contains("engine caps"), "{:?}", a.reasons);
     }
 
     #[test]
-    fn more_players_than_slots_is_badged_not_erased() {
+    fn more_players_than_slots_is_hidden() {
         let mut s = server("1.1.1.1:2303", "Liars");
         s.players = 40;
         s.max_players = 20;
         let index = ClusterIndex::build(std::slice::from_ref(&s), thresholds());
         let a = index.assess(&s);
-        assert!(!a.hide);
+        assert!(a.hide);
         assert_eq!(a.kind, ReasonKind::Arithmetic);
     }
 
@@ -335,14 +343,16 @@ mod tests {
     }
 
     #[test]
-    fn a_saturated_address_is_hidden() {
-        let servers: Vec<GameServer> = (0..thresholds().mega_host_listings)
+    fn a_saturated_address_is_badged_not_hidden() {
+        // Bulk is information now, not guilt. The duplication that made the machine busy is collapsed
+        // in the producer (one entry per machine and name), so 55 differently-named servers all stay.
+        let servers: Vec<GameServer> = (0..thresholds().mega_host_listings + 5)
             .map(|i| server(&format!("9.9.9.9:{}", 2000 + i), &format!("Farm #{i}")))
             .collect();
         let index = ClusterIndex::build(&servers, thresholds());
         let a = index.assess(&servers[0]);
-        assert!(a.hide);
-        assert!(a.reasons[0].contains("listings on one address"), "{:?}", a.reasons);
+        assert!(!a.hide, "a busy machine must not erase its servers: {:?}", a.reasons);
+        assert_eq!(a.kind, ReasonKind::SeveralOnOneAddress);
     }
 
     #[test]
@@ -364,6 +374,44 @@ mod tests {
         assert!(!a.hide, "a community must not be hidden for spanning addresses: {:?}", a.reasons);
         // Several on one address: badged, and still visible.
         assert_eq!(a.verdict, Verdict::Suspected);
+    }
+
+    #[test]
+    fn bulk_duplication_collapses_on_machine_and_name() {
+        use std::collections::HashSet;
+
+        // A farm: one machine, three names, each announced on hundreds of ports. Collapsing keeps one
+        // entry per name, so 1,200 rows become 3 without erasing anything.
+        let mut servers = Vec::new();
+        for port in 0..400 {
+            for (offset, name) in [(2000, "Farm A"), (6000, "Farm B"), (10000, "Farm C")] {
+                servers.push(server(&format!("9.9.9.9:{}", offset + port), name));
+            }
+        }
+        let kept: HashSet<(String, String)> = servers.iter().map(dedup_key).collect();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(servers.len(), 1200);
+
+        // And a community's fifty-three differently-named servers on one machine survive untouched:
+        // the key is per name, so nothing about running many servers is itself suspicious.
+        let community: Vec<GameServer> = (0..53)
+            .map(|i| server(&format!("185.83.152.170:{}", 2303 + i), &format!("[STPC] Server {i}")))
+            .collect();
+        let community_keys: HashSet<(String, String)> = community.iter().map(dedup_key).collect();
+        assert_eq!(community_keys.len(), 53);
+    }
+
+    #[test]
+    fn the_bulk_threshold_badges_rather_than_removes() {
+        // A busy machine is information, not guilt: it is badged and published, and the duplication
+        // that made it busy is collapsed elsewhere.
+        let servers: Vec<GameServer> = (0..thresholds().mega_host_listings + 5)
+            .map(|i| server(&format!("9.9.9.9:{}", 2000 + i), &format!("Farm #{i}")))
+            .collect();
+        let index = ClusterIndex::build(&servers, thresholds());
+        let a = index.assess(&servers[0]);
+        assert!(!a.hide, "a busy machine must not erase its servers: {:?}", a.reasons);
+        assert_eq!(a.kind, ReasonKind::SeveralOnOneAddress);
     }
 
     #[test]

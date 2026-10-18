@@ -195,6 +195,10 @@ async fn main() {
     let mut outcome: std::collections::HashMap<&str, (ReasonKind, bool)> =
         std::collections::HashMap::new();
     let mut hidden_rows: Vec<HiddenRow> = Vec::new();
+    // One entry per machine and name: the flood collapses here instead of being judged.
+    let mut seen_identities: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut collapsed = 0usize;
 
     for server in &found.servers {
         let assessment = index.assess(server);
@@ -229,6 +233,16 @@ async fn main() {
             }
             continue;
         }
+
+        // Collapse bulk duplication: one entry per machine and name. A farm announcing fifty names on
+        // two thousand ports becomes fifty entries, while a community running fifty differently-named
+        // servers on one box is untouched. No name is erased — which is why this is a collapse rather
+        // than one more reason to hide.
+        if !seen_identities.insert(cluster::dedup_key(server)) {
+            collapsed += 1;
+            continue;
+        }
+
         servers.push(Published {
             server: server.clone(),
             verdict: assessment.verdict,
@@ -272,6 +286,7 @@ async fn main() {
         );
     }
     println!("published  : {} of {} listings", servers.len(), found.servers.len());
+    println!("collapsed  : {collapsed} duplicate announcements (same machine, same name)");
     println!(
         "names      : {} seen, {} published, {} never published",
         names.len(),
