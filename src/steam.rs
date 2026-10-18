@@ -75,6 +75,9 @@ const EMPTY_BACKOFF_MS: u64 = 400;
 const STRAGGLER_ROUNDS: usize = 3;
 const STRAGGLER_PAUSE_MS: u64 = 400;
 
+/// Recovery asks for almost nothing at a time, because it exists to undo over-asking.
+const RECOVERY_CONCURRENCY: usize = 2;
+
 /// A wall-clock budget for the whole sweep.
 ///
 /// The recovery rounds are what turn "publish nothing" into "publish a list missing a few buckets",
@@ -82,7 +85,11 @@ const STRAGGLER_PAUSE_MS: u64 = 400;
 /// nothing at all. A deadline guarantees that every run produces an artifact, with `complete: false`
 /// and a `failed` count saying exactly what it cost. A list that is honestly 98% is worth infinitely
 /// more than a perfect one that never arrives.
-const SWEEP_BUDGET: Duration = Duration::from_secs(30 * 60);
+///
+/// Forty-five minutes because that is what completeness actually costs: Valve yields roughly half a
+/// good read per second under sustained pressure, and a deep sweep is a few thousand reads. The job
+/// timeout sits above this, so the budget is what stops a run, never the runner.
+const SWEEP_BUDGET: Duration = Duration::from_secs(45 * 60);
 
 /// The producer's token, when it has one.
 ///
@@ -93,6 +100,13 @@ fn producer_token() -> Option<String> {
         .ok()
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
+}
+
+/// Where to report progress, when there is a relay and a token to report through.
+fn progress_target() -> Option<(String, String)> {
+    let base = std::env::var("VAPOUR_RELAY").ok()?;
+    let token = producer_token()?;
+    Some((base, token))
 }
 
 /// How deep a name prefix may be subdivided before a saturated bucket is reported rather than split.
@@ -137,13 +151,15 @@ impl Transport {
 
     fn concurrency(&self) -> usize {
         match self {
-            // Measured 18-19/10/2026 against Valve.
+            // Measured 18-19/10/2026 against Valve, across four runs.
             //
-            // Sixteen *identical* queries at once (one bucket): 6/16 came back throttled. Sixteen
-            // *distinct* buckets at once: 81k rows in one 3.4 s wall-clock, ~6/16 throttled. A real
-            // page costs ~3.3 s whatever it holds, so throughput is attempts x success rate — and at
-            // sixteen that is roughly double what eight gives. Throttled attempts are no longer lost:
-            // they are retried with backoff, then recovered in rounds, and the sweep has a deadline.
+            // Sustained, which is what a sweep is: at 16 concurrent, ~615 reads and 144 of them good
+            // in ~280 s; at 8, 92 reads and 68 good in the same 280 s. So more pressure yields fewer
+            // successes *per attempt* and more *good reads per second* — about twice as many at 16.
+            // Burst behaviour is different again: 16 distinct buckets returned 81k rows in one 3.4 s
+            // wall-clock. Valve appears to allow roughly one good read per second and to punish
+            // persistence, so the shape that works is an aggressive first pass with a patient
+            // recovery behind it, rather than a compromise in between.
             Transport::Direct(_) => 16,
             Transport::Relay(_) => 16,
         }
@@ -218,6 +234,8 @@ pub struct Sweep<'a> {
     /// Queries Valve throttled, and queries that only succeeded on a retry.
     throttled: std::sync::atomic::AtomicUsize,
     recovered: std::sync::atomic::AtomicUsize,
+    /// Reads finished, for the progress beacon.
+    done: std::sync::atomic::AtomicUsize,
 }
 
 /// One attempt at one query.
@@ -252,6 +270,7 @@ impl<'a> Sweep<'a> {
             empty_stubborn: std::sync::atomic::AtomicUsize::new(0),
             throttled: std::sync::atomic::AtomicUsize::new(0),
             recovered: std::sync::atomic::AtomicUsize::new(0),
+            done: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -352,12 +371,24 @@ impl<'a> Sweep<'a> {
     /// them one by one would look parallel and be strictly sequential — an easy mistake with an ugly
     /// symptom, namely a sweep that takes hours with no explanation.
     async fn fetch_batch(&self, filters: Vec<String>) -> Vec<(String, Option<Vec<GameServer>>)> {
-        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(
-            self.transport.concurrency().max(1),
-        ));
+        self.fetch_batch_with(filters, self.transport.concurrency().max(1))
+            .await
+    }
+
+    /// The same batch at a chosen concurrency.
+    ///
+    /// Recovery uses this with a much smaller number: it exists because the fast pass over-asked, so
+    /// repeating the over-asking would defeat its whole purpose.
+    async fn fetch_batch_with(
+        &self,
+        filters: Vec<String>,
+        concurrency: usize,
+    ) -> Vec<(String, Option<Vec<GameServer>>)> {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
         let pace = self.transport.pace();
         let started = std::time::Instant::now();
         let issued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let planned = filters.len();
 
         let work = filters.into_iter().map(|filter| {
             let gate = std::sync::Arc::clone(&gate);
@@ -373,11 +404,46 @@ impl<'a> Sweep<'a> {
                     }
                 }
                 let rows = self.fetch(&filter).await.ok();
+
+                // A sweep of a few thousand reads gives no sign of life until it ends. Reporting the
+                // count as it goes is what makes "is this going or stuck?" answerable from outside,
+                // which is most of the pain of debugging a job you cannot watch.
+                let done = self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if done.is_multiple_of(100) || done == planned {
+                    self.report_progress(done, planned).await;
+                }
+
                 (filter, rows)
             }
         });
 
         futures::future::join_all(work).await
+    }
+
+    /// Best-effort progress beacon. Never allowed to fail a sweep, and never a reason to stop.
+    async fn report_progress(&self, done: usize, planned: usize) {
+        let Some((base, token)) = progress_target() else {
+            return;
+        };
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let body = format!(
+            "{{\"done\":{done},\"planned\":{planned},\"reads\":{},\"throttled\":{},\"recovered\":{},\"at\":{at}}}",
+            self.done.load(std::sync::atomic::Ordering::Relaxed),
+            self.throttled.load(std::sync::atomic::Ordering::Relaxed),
+            self.recovered.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let url = format!("{}/artifact/progress", base.trim_end_matches('/'));
+        let _ = self
+            .client
+            .put(&url)
+            .header("x-vapour-token", token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await;
     }
 
     /// The whole sweep: a ladder of name prefixes, deepening only where a bucket came back full.
@@ -457,7 +523,7 @@ impl<'a> Sweep<'a> {
                 break;
             }
 
-            let batches = self.fetch_batch(stragglers.clone()).await;
+            let batches = self.fetch_batch_with(stragglers.clone(), RECOVERY_CONCURRENCY).await;
             let mut still_failing = Vec::new();
             for (filter, rows) in batches {
                 match rows {

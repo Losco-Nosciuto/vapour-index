@@ -38,9 +38,8 @@ concurrency:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    # Generous: the relay paces requests just under its own rate limit, so a complete sweep is tens of
-    # minutes. Minutes are free on a public repository; the request ceiling bounds the work.
-    timeout-minutes: 60
+    # Above the sweep's own 45-minute budget, so the budget is what stops a run, never the runner.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
