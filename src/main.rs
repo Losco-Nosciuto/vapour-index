@@ -43,6 +43,26 @@ struct Counts {
     hidden: usize,
 }
 
+/// One hidden row, written to a diagnostic file.
+///
+/// The artifact carries only what is published, so the rows the filter removed — and the profile that
+/// condemned them — are invisible exactly when they matter most. This is the audit trail: which rows
+/// went, why, and what the host looked like at the time.
+#[derive(serde::Serialize)]
+struct HiddenRow<'a> {
+    addr: &'a str,
+    name: &'a str,
+    map: &'a str,
+    players: u16,
+    max_players: u16,
+    kind: &'static str,
+    reason: String,
+    ip: &'a str,
+    listings_on_ip: usize,
+    names_on_ip: usize,
+    borrowed_names: usize,
+}
+
 #[derive(serde::Serialize)]
 struct SweepStats {
     requests: usize,
@@ -86,6 +106,13 @@ async fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(12_000);
     let publish = args.iter().any(|a| a == "--publish");
+
+    // Optional diagnostic: write every hidden row, with the profile that condemned it, as JSON lines.
+    let dump_hidden = args
+        .iter()
+        .position(|a| a == "--dump-hidden")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
 
     // Re-publish an artifact that already exists, without sweeping again. Covers the case where the
     // enumeration succeeded but the upload did not, and lets the relay be tested for free.
@@ -167,6 +194,7 @@ async fn main() {
         std::collections::BTreeMap::new();
     let mut outcome: std::collections::HashMap<&str, (ReasonKind, bool)> =
         std::collections::HashMap::new();
+    let mut hidden_rows: Vec<HiddenRow> = Vec::new();
 
     for server in &found.servers {
         let assessment = index.assess(server);
@@ -182,6 +210,22 @@ async fn main() {
             *by_kind.entry(assessment.kind).or_insert(0) += 1;
             if !flood.contains(ip) {
                 *ordinary.entry(assessment.kind).or_insert(0) += 1;
+            }
+            if dump_hidden.is_some() {
+                let profile = index.profile_of(&server.addr);
+                hidden_rows.push(HiddenRow {
+                    addr: &server.addr,
+                    name: &server.name,
+                    map: &server.map,
+                    players: server.players,
+                    max_players: server.max_players,
+                    kind: assessment.kind.label(),
+                    reason: assessment.reasons.first().cloned().unwrap_or_default(),
+                    ip,
+                    listings_on_ip: profile.map(|p| p.listings).unwrap_or(0),
+                    names_on_ip: profile.map(|p| p.distinct_names).unwrap_or(0),
+                    borrowed_names: profile.map(|p| p.borrowed_names).unwrap_or(0),
+                });
             }
             continue;
         }
@@ -267,6 +311,23 @@ async fn main() {
         index.ip_count(),
         flood.len()
     );
+
+    if let Some(path) = dump_hidden.as_deref() {
+        let mut body = String::with_capacity(hidden_rows.len() * 200);
+        for row in &hidden_rows {
+            match serde_json::to_string(row) {
+                Ok(line) => {
+                    body.push_str(&line);
+                    body.push('\n');
+                }
+                Err(error) => eprintln!("could not serialise a hidden row: {error}"),
+            }
+        }
+        match std::fs::write(path, body) {
+            Ok(()) => println!("dumped     : {path}  ({} hidden rows)", hidden_rows.len()),
+            Err(error) => eprintln!("could not write {path}: {error}"),
+        }
+    }
 
     if let Some(path) = out {
         let artifact = Artifact {

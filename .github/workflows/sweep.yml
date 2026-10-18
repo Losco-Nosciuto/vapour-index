@@ -67,8 +67,6 @@ jobs:
           # sit just underneath them.
           VAPOUR_MAX_SLOTS: ${{ secrets.VAPOUR_MAX_SLOTS }}
           VAPOUR_MEGA_HOST_LISTINGS: ${{ secrets.VAPOUR_MEGA_HOST_LISTINGS }}
-          VAPOUR_BORROWED_MIN: ${{ secrets.VAPOUR_BORROWED_MIN }}
-          VAPOUR_BORROWED_SHARE: ${{ secrets.VAPOUR_BORROWED_SHARE }}
           MAX_REQUESTS: ${{ inputs.max_requests }}
         run: |
           extra=()

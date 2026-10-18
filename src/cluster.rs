@@ -4,20 +4,23 @@
 //! many distinct names**. The flood is **repetition**, not extra servers — and this module decides
 //! which of the repetitions are worth shipping.
 //!
-//! Three reasons to hide a server, and they are deliberately different in kind:
+//! Two reasons to hide a server, and both are arithmetic rather than opinion:
 //!
 //! | reason | evidence | certainty |
 //! |---|---|---|
 //! | arithmetic | more slots than the engine allows, or more players than slots | proof |
-//! | impersonation | most of a host's names also run on other addresses | strong |
 //! | mega-host | a single address publishing an implausible number of listings | strong |
 //!
-//! Everything else is **kept**, including the ambiguous band between a plausible handful and an
-//! implausible flood — because a real community can legitimately run a dozen servers on one box. Hiding
-//! real servers is the exact failure this whole exercise set out to fix.
+//! A third rule once hid hosts whose names also appeared on other addresses, on the theory that
+//! copying a popular name is impersonation. Audited against a real sweep, it was deleting 565 hosts
+//! — a median of fourteen servers each, one name per server, and 201 of them running twenty or more
+//! — because a community that spreads its servers across a hosting block has every name on more than
+//! one address. It punished the copied, not the copier. Removed.
 //!
-//! Padding that survives this filter is settled by **A2S on the client**: a pad claims a full house
-//! while `A2S_PLAYERS` names three.
+//! Everything else is **kept**, including the ambiguous band between a plausible handful and an
+//! implausible flood. Hiding real servers is the exact failure this whole exercise set out to fix, so
+//! the filter's bias runs the other way: when in doubt, publish and badge, and let A2S settle it on
+//! the client — a pad claims a full house while `A2S_PLAYERS` names three.
 //!
 //! The cut-offs themselves are in [`Thresholds`], read from the environment — see the note there.
 
@@ -28,19 +31,16 @@ use crate::steam::{ip_of, GameServer};
 /// The numbers the filter turns on.
 ///
 /// Deliberately **not** constants in this file. The producer runs in a public repository, and a flood
-/// that can read the thresholds can sit just underneath them: one listing fewer, one slot fewer, one
-/// borrowed name fewer. So the logic is public and the numbers are not, supplied from repository
-/// secrets at run time. That is a real reduction in what a farm learns, though not a guarantee —
-/// published reasons and observable behaviour still hint at where the lines are.
+/// that can read the thresholds can sit just underneath them: one listing fewer, one slot fewer. So
+/// the logic is public and the numbers are not, supplied from repository secrets at run time. That is
+/// a real reduction in what a farm learns, though not a guarantee — published reasons and observable
+/// behaviour still hint at where the lines are.
 #[derive(Debug, Clone, Copy)]
 pub struct Thresholds {
     /// DayZ cannot host more than this many players.
     pub engine_max_slots: u16,
     /// Above this many listings on one address, a host is a flood rather than a community.
     pub mega_host_listings: usize,
-    /// Names also seen on other addresses, beyond which a host is impersonating rather than hosting.
-    pub borrowed_name_min: usize,
-    pub borrowed_name_share: f32,
 }
 
 impl Thresholds {
@@ -64,8 +64,6 @@ impl Thresholds {
         Ok(Self {
             engine_max_slots: parse("VAPOUR_MAX_SLOTS")?,
             mega_host_listings: parse("VAPOUR_MEGA_HOST_LISTINGS")?,
-            borrowed_name_min: parse("VAPOUR_BORROWED_MIN")?,
-            borrowed_name_share: parse("VAPOUR_BORROWED_SHARE")?,
         })
     }
 }
@@ -91,8 +89,6 @@ pub enum ReasonKind {
     Arithmetic,
     /// One address publishing MEGA_HOST_LISTINGS or more.
     MegaHost,
-    /// A host whose names mostly also run on other addresses.
-    Impersonation,
     /// Several servers on one address — badged, never hidden.
     SeveralOnOneAddress,
     /// Nothing unexplained.
@@ -104,7 +100,6 @@ impl ReasonKind {
         match self {
             Self::Arithmetic => "arithmetic",
             Self::MegaHost => "mega-host",
-            Self::Impersonation => "impersonation",
             Self::SeveralOnOneAddress => "several-on-one-address",
             Self::None => "none",
         }
@@ -143,6 +138,12 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Share of this host's names that also exist on another address.
+    ///
+    /// No longer decides anything — the rule that used it was measured deleting real communities — but
+    /// it is kept in the report and the audit dump, because it is still how a spread-out community and
+    /// a copier look different at a glance.
+    #[allow(dead_code)]
     pub fn borrowed_share(&self) -> f32 {
         if self.distinct_names == 0 {
             return 0.0;
@@ -238,19 +239,10 @@ impl ClusterIndex {
             );
         }
 
-        // ---- a host whose names mostly belong to other hosts ----------------------------------
-        let impersonating = profile.borrowed_names >= thresholds.borrowed_name_min
-            && profile.borrowed_share() >= thresholds.borrowed_name_share;
-        if impersonating {
-            return Assessment::hide_with(
-                Verdict::Suspected,
-                ReasonKind::Impersonation,
-                format!(
-                    "{} of its {} names also run on other addresses",
-                    profile.borrowed_names, profile.distinct_names
-                ),
-            );
-        }
+        // No third test. A rule that hid hosts whose names appeared on other addresses was tried,
+        // measured, and removed: it deleted 565 real multi-server communities, because spreading
+        // servers across a hosting block puts every name on more than one address. See the module
+        // docs. What survives here is arithmetic — a claim the engine cannot honour — and bulk.
 
         // ---- several servers on one address: visible, badged, never hidden --------------------
         if profile.listings > 5 {
@@ -277,8 +269,6 @@ mod tests {
         Thresholds {
             engine_max_slots: 120,
             mega_host_listings: 50,
-            borrowed_name_min: 4,
-            borrowed_name_share: 0.6,
         }
     }
 
@@ -347,22 +337,24 @@ mod tests {
     }
 
     #[test]
-    fn a_host_republishing_other_peoples_names_is_hidden() {
+    fn a_community_spread_over_several_addresses_is_kept() {
+        // The exact shape the removed rule deleted: one community, 37 servers, one name per server,
+        // spread across a hosting block — so every one of its names also exists on a sibling address.
+        // 565 hosts looked like this in a real sweep, and they were real.
         let mut servers = Vec::new();
-        for i in 0..40 {
-            for (port, name) in [
-                (2303, "POPULAR #1"),
-                (2304, "POPULAR #2"),
-                (2305, "POPULAR #3"),
-                (2306, "POPULAR #4"),
-            ] {
-                servers.push(server(&format!("10.0.{i}.1:{port}"), name));
+        for block in 0..4 {
+            for i in 0..37 {
+                servers.push(server(
+                    &format!("31.77.142.{}:{}", 60 + block, 35000 + i),
+                    &format!("ATLANT PvP Cherno #{i}"),
+                ));
             }
         }
         let index = ClusterIndex::build(&servers, thresholds());
         let a = index.assess(&servers[0]);
-        assert!(a.hide, "{:?}", a.reasons);
-        assert!(a.reasons[0].contains("also run on other addresses"), "{:?}", a.reasons);
+        assert!(!a.hide, "a community must not be hidden for spanning addresses: {:?}", a.reasons);
+        // Several on one address: badged, and still visible.
+        assert_eq!(a.verdict, Verdict::Suspected);
     }
 
     #[test]
