@@ -151,17 +151,19 @@ impl Transport {
 
     fn concurrency(&self) -> usize {
         match self {
-            // Measured 18-19/10/2026 against Valve, across four runs.
+            // Measured 18-19/10/2026 against Valve, across six runs.
             //
-            // Sustained, which is what a sweep is: at 16 concurrent, ~615 reads and 144 of them good
-            // in ~280 s; at 8, 92 reads and 68 good in the same 280 s. So more pressure yields fewer
-            // successes *per attempt* and more *good reads per second* — about twice as many at 16.
-            // Burst behaviour is different again: 16 distinct buckets returned 81k rows in one 3.4 s
-            // wall-clock. Valve appears to allow roughly one good read per second and to punish
-            // persistence, so the shape that works is an aggressive first pass with a patient
-            // recovery behind it, rather than a compromise in between.
-            Transport::Direct(_) => 16,
-            Transport::Relay(_) => 16,
+            // In a fresh state: 16 concurrent reads returned 81k rows in one 3.4 s wall-clock, and a
+            // sustained sweep at 16 got roughly twice the good reads of one at 8. Then, after several
+            // sweeps in an evening, the same key saw 89% of attempts throttled — 45 good reads out of
+            // 400 — and no amount of parallelism helped, because the limit had stopped being about
+            // pressure and started being about us.
+            //
+            // So the number is deliberately modest: it is chosen for the state we are actually in
+            // rather than the state we were in at the start of the evening. A sweep finishing in
+            // twenty minutes beats a sweep that finishes in ten and writes off most of the list.
+            Transport::Direct(_) => 4,
+            Transport::Relay(_) => 4,
         }
     }
 
