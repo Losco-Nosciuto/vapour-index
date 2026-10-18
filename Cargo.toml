@@ -1,0 +1,29 @@
+[package]
+name = "vapour-crawler"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Server-list producer for DayZ Vapour Launcher"
+
+# Deliberately its own crate and NOT a member of the Tauri app.
+#
+# The app crate depends on `tauri`, which on Linux needs WebKit/GTK development packages — building
+# it in GitHub Actions would cost five to ten billed minutes per run instead of seconds. This crate
+# depends on nothing native: `rustls` for TLS so no `libssl-dev`, and no GUI toolkit at all.
+#
+# Consequence worth knowing: the flood filter lives here, not in the app. The producer filters and
+# the client displays what it is sent, so there is exactly one implementation of the rule.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"
+flate2 = "1"
+
+[[bin]]
+name = "vapour-crawler"
+path = "src/main.rs"

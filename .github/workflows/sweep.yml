@@ -1,0 +1,87 @@
+# The producer: enumerate Valve's master list, filter the flood, publish one artifact.
+#
+# Two clocks, and this workflow is the slow one. The **directory** — which servers exist, on what map,
+# with how many slots — changes over days, so an hourly sweep is generous. Modlists are live state and
+# need a ten-to-twenty minute pass; that is a separate pipeline reading A2S directly from each server,
+# it does not belong here, and it costs no Valve API call.
+#
+# Why hourly and not more often: a complete sweep costs roughly one Valve API call per name bucket, and
+# Valve allows about 100k calls a day per key. Hourly stays far below that. Every twenty minutes would
+# not, and would also spend most of its time re-reading the same farm rows.
+#
+# The four things that keep consumption predictable and honest:
+#   timeout-minutes  — a hung sweep cannot run all day
+#   concurrency      — two sweeps can never overlap and race on the artifact
+#   no matrix        — one runner, not six
+#   relay transport  — Valve's API key never enters this public repository
+
+name: sweep
+
+on:
+  schedule:
+    # :17 rather than :00: GitHub delays runs scheduled on the hour, when everyone's cron fires.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_requests:
+        description: "Cap on the sweep (empty = complete)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    # Generous: the relay paces requests just under its own rate limit, so a complete sweep is tens of
+    # minutes. Minutes are free on a public repository; the request ceiling bounds the work.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check configuration
+        env:
+          VAPOUR_TOKEN: ${{ secrets.VAPOUR_UPLOAD_TOKEN }}
+        run: |
+          if [ -z "$VAPOUR_TOKEN" ]; then
+            echo "::error::VAPOUR_UPLOAD_TOKEN is not set. Add it under Settings > Secrets and variables > Actions, then re-run."
+            exit 1
+          fi
+
+      - name: Enumerate, filter, publish
+        env:
+          # Reading and publishing both go through the relay, which holds the Valve key. Nothing in
+          # this repository, its logs or its secrets ever sees that key.
+          VAPOUR_RELAY: https://dayz-vapour-relay.chrisplayer.workers.dev
+          VAPOUR_TOKEN: ${{ secrets.VAPOUR_UPLOAD_TOKEN }}
+          # The filter's cut-offs live in secrets, never in the source: a flood that can read them can
+          # sit just underneath them.
+          VAPOUR_MAX_SLOTS: ${{ secrets.VAPOUR_MAX_SLOTS }}
+          VAPOUR_MEGA_HOST_LISTINGS: ${{ secrets.VAPOUR_MEGA_HOST_LISTINGS }}
+          VAPOUR_BORROWED_MIN: ${{ secrets.VAPOUR_BORROWED_MIN }}
+          VAPOUR_BORROWED_SHARE: ${{ secrets.VAPOUR_BORROWED_SHARE }}
+          MAX_REQUESTS: ${{ inputs.max_requests }}
+        run: |
+          extra=()
+          if [ -n "$MAX_REQUESTS" ]; then
+            extra=(--max-requests "$MAX_REQUESTS")
+          fi
+          cargo run --release --quiet -- --out artifact.json.gz --publish "${extra[@]}"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f artifact.json.gz ]; then
+            echo "artifact: $(stat -c%s artifact.json.gz) bytes" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no artifact was produced" >> "$GITHUB_STEP_SUMMARY"
+          fi
