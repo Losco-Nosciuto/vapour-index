@@ -425,9 +425,17 @@ async fn publish_artifact(bytes: &[u8]) {
         }
     };
 
+    // Tells the relay when this was produced, so a client can decide whether it needs the payload at
+    // all with a HEAD instead of downloading it.
+    let generated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     match client
         .put(&url)
         .header("x-vapour-token", token.trim())
+        .header("x-vapour-generated-at", generated_at.to_string())
         .header("content-type", "application/gzip")
         .body(bytes.to_vec())
         .send()
