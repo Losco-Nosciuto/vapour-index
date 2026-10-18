@@ -71,9 +71,18 @@ pub const NAME_BUCKETS: &[&str] = &[
 const EMPTY_ATTEMPTS: usize = 4;
 const EMPTY_BACKOFF_MS: u64 = 400;
 
-/// Rounds of patient, one-at-a-time recovery for buckets Valve throttled, and the pause per round.
+/// Rounds of patient recovery for buckets Valve throttled, and the pause between rounds.
 const STRAGGLER_ROUNDS: usize = 3;
 const STRAGGLER_PAUSE_MS: u64 = 400;
+
+/// A wall-clock budget for the whole sweep.
+///
+/// The recovery rounds are what turn "publish nothing" into "publish a list missing a few buckets",
+/// but they are deliberately slow, and slow is how a sweep outlives its job timeout and publishes
+/// nothing at all. A deadline guarantees that every run produces an artifact, with `complete: false`
+/// and a `failed` count saying exactly what it cost. A list that is honestly 98% is worth infinitely
+/// more than a perfect one that never arrives.
+const SWEEP_BUDGET: Duration = Duration::from_secs(30 * 60);
 
 /// The producer's token, when it has one.
 ///
@@ -131,14 +140,12 @@ impl Transport {
             // Measured 18-19/10/2026 against Valve.
             //
             // Sixteen *identical* queries at once (one bucket): 6/16 came back throttled. Sixteen
-            // *distinct* buckets at once: 81k rows in one 3.4 s wall-clock, ~6/16 throttled. So the
-            // throttling is about pressure, not about duplicate filters, and a real page costs ~3.3 s
-            // no matter how many rows it holds.
-            //
-            // Eight keeps most of that speed with few enough stragglers for the second pass to clean
-            // up, and a sweep only costs as many pages as the distribution demands.
-            Transport::Direct(_) => 8,
-            Transport::Relay(_) => 8,
+            // *distinct* buckets at once: 81k rows in one 3.4 s wall-clock, ~6/16 throttled. A real
+            // page costs ~3.3 s whatever it holds, so throughput is attempts x success rate — and at
+            // sixteen that is roughly double what eight gives. Throttled attempts are no longer lost:
+            // they are retried with backoff, then recovered in rounds, and the sweep has a deadline.
+            Transport::Direct(_) => 16,
+            Transport::Relay(_) => 16,
         }
     }
 
@@ -383,6 +390,7 @@ impl<'a> Sweep<'a> {
     /// far more evenly — so the ladder lengthens the prefix instead, and only for full buckets.
     pub async fn run(&self) -> Result<Enumerated, String> {
         let mut result = Enumerated::default();
+        let started = std::time::Instant::now();
 
         let mut level: Vec<String> = NAME_BUCKETS.iter().map(|p| (*p).to_string()).collect();
         let mut depth = 1;
@@ -429,7 +437,8 @@ impl<'a> Sweep<'a> {
 
             // Stop cleanly rather than overrun. The next level is the only thing that costs anything,
             // so it is budgeted before it is issued, and whatever is left over is reported.
-            if result.requests + deeper.len() > self.max_requests {
+            let over_budget = started.elapsed() >= SWEEP_BUDGET;
+            if over_budget || result.requests + deeper.len() > self.max_requests {
                 result.unresolved += deeper.len();
                 break;
             }
@@ -439,34 +448,36 @@ impl<'a> Sweep<'a> {
         }
 
         // Recovery rounds over whatever failed: throttling is caused by asking for too much at once,
-        // so the retry that works is the patient one. One query at a time, a pause growing with each
-        // round, and a bounded number of rounds. Anything still unread at the end stays counted as a
-        // failure, which is what makes the sweep report itself a lower bound instead of a complete
-        // list — the difference between a number and a lie.
+        // so the retry that works is the patient one. Batched rather than one-at-a-time — each attempt
+        // already backs off internally, so patience comes from the retries, not from a queue — and
+        // stopped at the sweep's deadline. Anything still unread stays counted as a failure, which is
+        // what makes the sweep report itself a lower bound instead of a complete list.
         for round in 0..STRAGGLER_ROUNDS {
-            if stragglers.is_empty() {
+            if stragglers.is_empty() || started.elapsed() >= SWEEP_BUDGET {
                 break;
             }
-            let mut still_failing = Vec::new();
-            for filter in stragglers.drain(..) {
-                let pause = STRAGGLER_PAUSE_MS * (round as u64 + 1);
-                tokio::time::sleep(Duration::from_millis(pause)).await;
 
-                match self.fetch_once(&filter, self.limit - 1 - round as u32).await {
-                    Ok(Attempt::Rows(rows)) => {
-                        result.failed = result.failed.saturating_sub(1);
+            let batches = self.fetch_batch(stragglers.clone()).await;
+            let mut still_failing = Vec::new();
+            for (filter, rows) in batches {
+                match rows {
+                    Some(rows) => {
                         self.recovered
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if rows.len() >= MASTER_ROW_CAP {
                             // Recovered, but still full: honest about what was not resolved.
                             result.unresolved += 1;
                         }
+                        result.requests += 1;
                         collect(&mut result, rows);
                     }
-                    _ => still_failing.push(filter),
+                    None => still_failing.push(filter),
                 }
             }
             stragglers = still_failing;
+
+            let pause = STRAGGLER_PAUSE_MS * (round as u64 + 1);
+            tokio::time::sleep(Duration::from_millis(pause)).await;
         }
         result.failed = stragglers.len();
 
