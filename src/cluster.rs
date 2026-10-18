@@ -4,23 +4,24 @@
 //! many distinct names**. The flood is **repetition**, not extra servers — and this module decides
 //! which of the repetitions are worth shipping.
 //!
-//! Two reasons to hide a server, and both are arithmetic rather than opinion:
+//! Two reasons to act on a server, and neither is "I think this is fake":
 //!
-//! | reason | evidence | certainty |
+//! | reason | evidence | what happens |
 //! |---|---|---|
-//! | arithmetic | more slots than the engine allows, or more players than slots | proof |
-//! | mega-host | a single address publishing an implausible number of listings | strong |
+//! | arithmetic | more slots than the engine allows, or more players than slots | **published, badged** |
+//! | mega-host | one address publishing an implausible number of listings | hidden |
+//!
+//! Arithmetic used to hide as well. It no longer does, because "provably impossible" and "worth
+//! removing" are different claims, and only the second one justifies deletion. A server advertising
+//! 255 slots cannot exist; it is also not mine to erase, so it ships with a badge that says so and a
+//! client that can sort it away. The only remaining deletion is bulk: one address announcing two
+//! thousand listings is the pollution that makes the list unusable, and that is measured, not guessed.
 //!
 //! A third rule once hid hosts whose names also appeared on other addresses, on the theory that
 //! copying a popular name is impersonation. Audited against a real sweep, it was deleting 565 hosts
 //! — a median of fourteen servers each, one name per server, and 201 of them running twenty or more
 //! — because a community that spreads its servers across a hosting block has every name on more than
 //! one address. It punished the copied, not the copier. Removed.
-//!
-//! Everything else is **kept**, including the ambiguous band between a plausible handful and an
-//! implausible flood. Hiding real servers is the exact failure this whole exercise set out to fix, so
-//! the filter's bias runs the other way: when in doubt, publish and badge, and let A2S settle it on
-//! the client — a pad claims a full house while `A2S_PLAYERS` names three.
 //!
 //! The cut-offs themselves are in [`Thresholds`], read from the environment — see the note there.
 
@@ -207,10 +208,13 @@ impl ClusterIndex {
     pub fn assess(&self, server: &GameServer) -> Assessment {
         let thresholds = self.thresholds;
 
-        // ---- arithmetic: the engine cannot do this -------------------------------------------
+        // ---- arithmetic: the engine cannot do this. Published anyway, badged. -----------------
+        //
+        // Deleting was the old behaviour and it was wrong twice over: impossible is not the same as
+        // worthless, and a filter that erases what it disapproves of is the thing this project exists
+        // to replace. The claim is still recorded, in the badge and in the artifact.
         if server.max_players > thresholds.engine_max_slots {
-            return Assessment::hide_with(
-                Verdict::Impossible,
+            return Assessment::badge(
                 ReasonKind::Arithmetic,
                 format!(
                     "advertises {} slots; the engine caps at {}",
@@ -219,8 +223,7 @@ impl ClusterIndex {
             );
         }
         if server.max_players > 0 && server.players > server.max_players {
-            return Assessment::hide_with(
-                Verdict::Impossible,
+            return Assessment::badge(
                 ReasonKind::Arithmetic,
                 format!("claims {} players in {} slots", server.players, server.max_players),
             );
@@ -291,22 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn an_impossible_slot_count_is_hidden_whatever_else_is_true() {
+    fn an_impossible_slot_count_is_badged_but_still_published() {
+        // Deleting it was the old behaviour. Impossible is a claim to record, not a licence to erase:
+        // the server ships with the badge, and the client decides what to do about it.
         let mut s = server("1.1.1.1:2303", "Liars");
         s.max_players = 200;
         let index = ClusterIndex::build(std::slice::from_ref(&s), thresholds());
         let a = index.assess(&s);
-        assert_eq!(a.verdict, Verdict::Impossible);
-        assert!(a.hide);
+        assert!(!a.hide, "an impossible claim must not remove a server from the list");
+        assert_eq!(a.kind, ReasonKind::Arithmetic);
+        assert_eq!(a.verdict, Verdict::Suspected);
+        assert!(a.reasons[0].contains("engine caps"), "{:?}", a.reasons);
     }
 
     #[test]
-    fn more_players_than_slots_is_hidden() {
+    fn more_players_than_slots_is_badged_not_erased() {
         let mut s = server("1.1.1.1:2303", "Liars");
         s.players = 40;
         s.max_players = 20;
         let index = ClusterIndex::build(std::slice::from_ref(&s), thresholds());
-        assert!(index.assess(&s).hide);
+        let a = index.assess(&s);
+        assert!(!a.hide);
+        assert_eq!(a.kind, ReasonKind::Arithmetic);
     }
 
     #[test]
