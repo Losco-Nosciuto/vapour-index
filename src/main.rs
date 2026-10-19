@@ -45,10 +45,12 @@ struct Counts {
     distinct_names: usize,
     distinct_ips: usize,
     clean: usize,
-    /// Shown with a badge.
+    /// Badged by the producer. Nothing is badged any more, but the field stays so old artifacts parse.
     suspected: usize,
     /// Kept out of the list, with the reason carried per row for anyone who asks.
     hidden: usize,
+    /// Carried over from earlier runs because this one could not read their buckets again.
+    carried: usize,
 }
 
 /// One hidden row, written to a diagnostic file.
@@ -83,12 +85,20 @@ struct PublishedRow {
     server: GameServer,
 }
 
+#[derive(serde::Deserialize)]
+struct CompactVerdict {
+    a: String,
+    p: u8,
+    b: u8,
+    ok: bool,
+}
+
 /// Reads what the A2S pass last published, stamped with the relay's idea of when.
 ///
 /// Every failure returns `None`, which means "no verdicts": the one safe outcome, because a verdict
 /// that cannot be read must never delete a server.
 async fn load_verdicts(relay: &str) -> Option<a2s::Verdicts> {
-    let url = format!("{}/artifact/a2s", relay.trim_end_matches('/'));
+    let url = format!("{}/artifact/verdicts", relay.trim_end_matches('/'));
     let response = reqwest::get(&url).await.ok()?;
     if !response.status().is_success() {
         return None;
@@ -109,8 +119,34 @@ async fn load_verdicts(relay: &str) -> Option<a2s::Verdicts> {
         bytes.to_vec()
     };
 
-    let readings: Vec<a2s::Reading> = serde_json::from_slice(&json).ok()?;
-    Some(a2s::Verdicts::from_readings(&readings, at))
+    let entries: Vec<CompactVerdict> = serde_json::from_slice(&json).ok()?;
+    Some(a2s::Verdicts::from_entries(
+        entries.into_iter().map(|v| (v.a, v.b, v.ok, v.p)),
+        at,
+    ))
+}
+
+/// Reads what the previous run published, so this one can add to it instead of replacing it.
+///
+/// A sweep that fails to read a bucket must not delete the servers that bucket gave it last time. The
+/// published list is a union of what has been read, and A2S marks what has gone quiet — so coverage
+/// only ever grows, and a bad night costs freshness rather than servers.
+async fn load_previous(relay: &str) -> Option<Vec<GameServer>> {
+    let url = format!("{}/artifact/servers", relay.trim_end_matches('/'));
+    let response = reqwest::get(&url).await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    let json = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut text = Vec::new();
+        flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut text).ok()?;
+        text
+    } else {
+        bytes.to_vec()
+    };
+    let list: PublishedList = serde_json::from_slice(&json).ok()?;
+    Some(list.servers.into_iter().map(|row| row.server).collect())
 }
 
 /// Query every server in the published list, and report what answers.
@@ -249,6 +285,35 @@ async fn run_a2s(args: &[String], publish: bool) -> Result<(), String> {
 
     if publish {
         publish_artifact("a2s", &bytes).await;
+
+        // A compact companion for the client: address, players, bots. The full readings carry every
+        // mod list and run to five megabytes; a launcher drawing a list needs only the counts.
+        #[derive(serde::Serialize)]
+        struct Line<'a> {
+            a: &'a str,
+            p: u8,
+            b: u8,
+            ok: bool,
+        }
+        let lines: Vec<Line> = readings
+            .iter()
+            .map(|reading| Line {
+                a: &reading.addr,
+                p: reading.info.as_ref().map(|info| info.players).unwrap_or(0),
+                b: reading.info.as_ref().map(|info| info.bots).unwrap_or(0),
+                ok: reading.answered,
+            })
+            .collect();
+
+        if let Ok(json) = serde_json::to_vec(&lines) {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            if encoder.write_all(&json).is_ok()
+                && let Ok(bytes) = encoder.finish()
+            {
+                publish_artifact("verdicts", &bytes).await;
+            }
+        }
     }
 
     Ok(())
@@ -371,9 +436,35 @@ async fn main() {
 
     report(&found, thresholds);
 
+    // Carry forward what the last run published. A bucket that failed this time must not delete the
+    // servers it found last time, so the index is a union and coverage only grows.
+    let relay = std::env::var("VAPOUR_RELAY").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+    let mut merged: Vec<GameServer> = found.servers.clone();
+    let carried = match load_previous(&relay).await {
+        Some(previous) => {
+            let mut seen: std::collections::HashSet<String> =
+                merged.iter().map(|s| s.addr.clone()).collect();
+            let before = merged.len();
+            for server in previous {
+                if seen.insert(server.addr.clone()) {
+                    merged.push(server);
+                }
+            }
+            let added = merged.len() - before;
+            println!(
+                "carried    : {} servers from the previous run ({added} of them not read this time)",
+                added
+            );
+            added
+        }
+        None => {
+            println!("carried    : nothing (no previous run, or the relay had none)");
+            0
+        }
+    };
+
     // What the servers said about themselves the last time they were asked. Absent, ancient or
     // unreadable all mean the same thing: no verdicts, and therefore no deletions on their account.
-    let relay = std::env::var("VAPOUR_RELAY").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
     let verdicts = load_verdicts(&relay).await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -385,15 +476,15 @@ async fn main() {
         None => println!("verdicts   : none yet (the A2S pass has not run)"),
     }
 
-    let index = ClusterIndex::build(&found.servers, thresholds);
-    let mut servers = Vec::with_capacity(found.servers.len());
+    let index = ClusterIndex::build(&merged, thresholds);
+    let mut servers = Vec::with_capacity(merged.len());
     let mut clean = 0usize;
     let mut suspected = 0usize;
     let mut hidden = 0usize;
 
     // Listings per address: the thing the filter keys on, needed here for the audit.
     let mut per_ip: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for server in &found.servers {
+    for server in &merged {
         *per_ip.entry(steam::ip_of(&server.addr)).or_insert(0) += 1;
     }
     let flood: std::collections::HashSet<&str> = per_ip
@@ -417,7 +508,7 @@ async fn main() {
         std::collections::HashSet::new();
     let mut collapsed = 0usize;
 
-    for server in &found.servers {
+    for server in &merged {
         let assessment = index.assess(server);
         let ip = steam::ip_of(&server.addr);
         outcome.entry(ip).or_insert((assessment.kind, assessment.hide));
@@ -480,7 +571,7 @@ async fn main() {
     }
 
     let names: std::collections::HashSet<&str> =
-        found.servers.iter().map(|s| s.name.as_str()).collect();
+        merged.iter().map(|s| s.name.as_str()).collect();
     let ips = index.ip_count();
 
     // The number that decides whether this filter is honest. A name whose every row sits on a flood
@@ -491,7 +582,7 @@ async fn main() {
         servers.iter().map(|p| p.server.name.as_str()).collect();
     let mut lost_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut lost_on_ordinary: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for server in &found.servers {
+    for server in &merged {
         let name = server.name.as_str();
         if published_names.contains(name) {
             continue;
@@ -514,7 +605,7 @@ async fn main() {
             kind.label()
         );
     }
-    println!("published  : {} of {} listings", servers.len(), found.servers.len());
+    println!("published  : {} of {} listings", servers.len(), merged.len());
     println!("collapsed  : {collapsed} duplicate announcements (same machine, same name)");
     println!(
         "names      : {} seen, {} published, {} never published",
@@ -595,12 +686,13 @@ async fn main() {
                 complete: found.complete(),
             },
             counts: Counts {
-                listings: found.servers.len(),
+                listings: merged.len(),
                 distinct_names: names.len(),
                 distinct_ips: ips,
                 clean,
                 suspected,
                 hidden,
+                carried,
             },
             servers,
         };

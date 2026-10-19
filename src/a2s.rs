@@ -123,16 +123,6 @@ pub struct Verdicts {
 const VERDICT_LIFETIME_SECONDS: u64 = 60 * 60;
 
 impl Verdicts {
-    pub fn from_readings(readings: &[Reading], at: u64) -> Self {
-        let mut by_addr = std::collections::HashMap::with_capacity(readings.len());
-        for reading in readings {
-            let bots = reading.info.as_ref().map(|info| info.bots).unwrap_or(0);
-            let players = reading.info.as_ref().map(|info| info.players).unwrap_or(0);
-            by_addr.insert(reading.addr.clone(), (bots, reading.answered, players));
-        }
-        Self { at, readings: by_addr }
-    }
-
     /// Whether this is recent enough to act on.
     pub fn fresh(&self, now: u64) -> bool {
         now.saturating_sub(self.at) <= VERDICT_LIFETIME_SECONDS
@@ -140,6 +130,17 @@ impl Verdicts {
 
     pub fn get(&self, addr: &str) -> Option<(u8, bool, u8)> {
         self.readings.get(addr).copied()
+    }
+
+    /// Builds from the compact form the producer publishes for clients: bots, answered, players.
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, u8, bool, u8)>, at: u64) -> Self {
+        Self {
+            at,
+            readings: entries
+                .into_iter()
+                .map(|(addr, bots, answered, players)| (addr, (bots, answered, players)))
+                .collect(),
+        }
     }
 
     pub fn len(&self) -> usize {
