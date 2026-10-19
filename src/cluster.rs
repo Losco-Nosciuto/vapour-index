@@ -123,8 +123,13 @@ impl Assessment {
         Self { verdict, kind, reasons: vec![reason], hide: true }
     }
 
-    fn badge(kind: ReasonKind, reason: String) -> Self {
-        Self { verdict: Verdict::Suspected, kind, reasons: vec![reason], hide: false }
+    /// A fact worth showing that is **not** a verdict.
+    ///
+    /// "This machine hosts fourteen servers" is true of nine tenths of the DayZ population, because
+    /// hosting is normal. Marking those servers suspect told the user they were probably fake, which is
+    /// the opposite of what the data says — so the information travels, the accusation does not.
+    fn note(kind: ReasonKind, reason: String) -> Self {
+        Self { verdict: Verdict::Clean, kind, reasons: vec![reason], hide: false }
     }
 }
 
@@ -246,14 +251,11 @@ impl ClusterIndex {
         // servers across a hosting block puts every name on more than one address. See the module
         // docs. Arithmetic is now the only thing that removes a row.
 
-        // ---- several servers on one address: visible, badged -----------------------------------
+        // ---- several servers on one address: information, never a verdict ----------------------
         if profile.listings > 5 {
-            return Assessment::badge(
+            return Assessment::note(
                 ReasonKind::SeveralOnOneAddress,
-                format!(
-                    "host runs {} listings on one address — common for communities, and for pads",
-                    profile.listings
-                ),
+                format!("shared host: {} servers on one address", profile.listings),
             );
         }
 
@@ -339,7 +341,7 @@ mod tests {
             assert!(!a.hide, "{} was hidden: {:?}", s.name, a.reasons);
         }
         // Several on one address, but with its own names: badged, not hidden.
-        assert_eq!(index.assess(&servers[0]).verdict, Verdict::Suspected);
+        assert_eq!(index.assess(&servers[0]).verdict, Verdict::Clean, "crowding is information, not a verdict");
     }
 
     #[test]
@@ -373,7 +375,7 @@ mod tests {
         let a = index.assess(&servers[0]);
         assert!(!a.hide, "a community must not be hidden for spanning addresses: {:?}", a.reasons);
         // Several on one address: badged, and still visible.
-        assert_eq!(a.verdict, Verdict::Suspected);
+        assert_eq!(a.verdict, Verdict::Clean, "crowding is information, not a verdict");
     }
 
     #[test]
@@ -433,6 +435,6 @@ mod tests {
         let index = ClusterIndex::build(&servers, thresholds());
         let a = index.assess(&servers[0]);
         assert!(!a.hide, "ambiguous hosts must stay visible: {:?}", a.reasons);
-        assert_eq!(a.verdict, Verdict::Suspected);
+        assert_eq!(a.verdict, Verdict::Clean, "crowding is information, not a verdict");
     }
 }
