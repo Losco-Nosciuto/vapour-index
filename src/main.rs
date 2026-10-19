@@ -32,6 +32,11 @@ struct Published {
     server: GameServer,
     verdict: Verdict,
     reasons: Vec<String>,
+    /// What the A2S pass last saw: `true` answered, `false` did not, `null` never checked.
+    ///
+    /// An unreachable server is not deleted — it is marked, so the client can keep it out of the way
+    /// and still offer it, which is how the launcher this is modelled on treats them too.
+    online: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -78,12 +83,42 @@ struct PublishedRow {
     server: GameServer,
 }
 
+/// Reads what the A2S pass last published, stamped with the relay's idea of when.
+///
+/// Every failure returns `None`, which means "no verdicts": the one safe outcome, because a verdict
+/// that cannot be read must never delete a server.
+async fn load_verdicts(relay: &str) -> Option<a2s::Verdicts> {
+    let url = format!("{}/artifact/a2s", relay.trim_end_matches('/'));
+    let response = reqwest::get(&url).await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let at = response
+        .headers()
+        .get("x-vapour-generated-at")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let bytes = response.bytes().await.ok()?;
+    let json = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut text = Vec::new();
+        flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut text).ok()?;
+        text
+    } else {
+        bytes.to_vec()
+    };
+
+    let readings: Vec<a2s::Reading> = serde_json::from_slice(&json).ok()?;
+    Some(a2s::Verdicts::from_readings(&readings, at))
+}
+
 /// Query every server in the published list, and report what answers.
 ///
 /// This is the farm signal as much as the mod signal. A server that answers as itself cannot hide what
 /// it runs, and a cluster sharing a mod list, a slot count and a name prefix is visible here and
 /// nowhere in Valve's list.
-async fn run_a2s(args: &[String]) -> Result<(), String> {
+async fn run_a2s(args: &[String], publish: bool) -> Result<(), String> {
     fn value<'a>(args: &'a [String], name: &str) -> Option<&'a String> {
         args.iter().position(|a| a == name).and_then(|i| args.get(i + 1))
     }
@@ -195,17 +230,23 @@ async fn run_a2s(args: &[String]) -> Result<(), String> {
             .join(", ")
     );
 
+    let json = serde_json::to_vec(&readings).map_err(|e| e.to_string())?;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&json).map_err(|e| e.to_string())?;
+    let bytes = encoder.finish().map_err(|e| e.to_string())?;
+    println!(
+        "readings   : {:.1} KB raw, {:.1} KB gzipped",
+        json.len() as f32 / 1024.0,
+        bytes.len() as f32 / 1024.0
+    );
+
     if let Some(path) = out {
-        let json = serde_json::to_vec(&readings).map_err(|e| e.to_string())?;
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-        encoder.write_all(&json).map_err(|e| e.to_string())?;
-        let bytes = encoder.finish().map_err(|e| e.to_string())?;
         std::fs::write(&path, &bytes).map_err(|e| format!("{path}: {e}"))?;
-        println!(
-            "wrote      : {path}  ({:.1} KB raw, {:.1} KB gzipped)",
-            json.len() as f32 / 1024.0,
-            bytes.len() as f32 / 1024.0
-        );
+        println!("wrote      : {path}");
+    }
+
+    if publish {
+        publish_artifact("a2s", &bytes).await;
     }
 
     Ok(())
@@ -258,7 +299,7 @@ async fn main() {
     // The A2S pass: queries the published list and reports what answers. No Valve involvement, so it
     // runs on its own clock later; here it is a mode so the data can be gathered and looked at now.
     if args.iter().any(|a| a == "--a2s") {
-        match run_a2s(&args).await {
+        match run_a2s(&args, publish).await {
             Ok(()) => return,
             Err(error) => {
                 eprintln!("{error}");
@@ -285,7 +326,7 @@ async fn main() {
             eprintln!("could not read {path}: {error}");
             std::process::exit(2);
         });
-        publish_artifact(&bytes).await;
+        publish_artifact("servers", &bytes).await;
         return;
     }
 
@@ -328,6 +369,20 @@ async fn main() {
 
     report(&found, thresholds);
 
+    // What the servers said about themselves the last time they were asked. Absent, ancient or
+    // unreadable all mean the same thing: no verdicts, and therefore no deletions on their account.
+    let relay = std::env::var("VAPOUR_RELAY").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+    let verdicts = load_verdicts(&relay).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match verdicts.as_ref() {
+        Some(v) if v.fresh(now) => println!("verdicts   : {} addresses from the A2S pass", v.len()),
+        Some(_) => println!("verdicts   : stale, so ignored"),
+        None => println!("verdicts   : none yet (the A2S pass has not run)"),
+    }
+
     let index = ClusterIndex::build(&found.servers, thresholds);
     let mut servers = Vec::with_capacity(found.servers.len());
     let mut clean = 0usize;
@@ -364,6 +419,26 @@ async fn main() {
         let assessment = index.assess(server);
         let ip = steam::ip_of(&server.addr);
         outcome.entry(ip).or_insert((assessment.kind, assessment.hide));
+
+        // What the server itself said, when the reading is recent enough to act on. This is the one
+        // signal Valve's list cannot give: a master row's `bots` field just mirrors its players, while
+        // a server that answers a query with bots is telling on itself. DayZ has no bots.
+        let verdict = verdicts
+            .as_ref()
+            .filter(|v| v.fresh(now))
+            .and_then(|v| v.get(&server.addr));
+        let online = verdict.map(|(_, answered, _)| answered);
+
+        if let Some((bots, _, _)) = verdict
+            && bots > 0
+        {
+            hidden += 1;
+            *by_kind.entry(ReasonKind::Bots).or_insert(0) += 1;
+            if !flood.contains(ip) {
+                *ordinary.entry(ReasonKind::Bots).or_insert(0) += 1;
+            }
+            continue;
+        }
 
         match assessment.verdict {
             Verdict::Clean => clean += 1,
@@ -407,6 +482,7 @@ async fn main() {
             server: server.clone(),
             verdict: assessment.verdict,
             reasons: assessment.reasons,
+            online,
         });
     }
 
@@ -568,7 +644,7 @@ async fn main() {
         }
 
         if publish {
-            publish_artifact(&bytes).await;
+            publish_artifact("servers", &bytes).await;
         }
     }
 }
@@ -580,7 +656,7 @@ async fn main() {
 ///
 /// The upload is token-gated with a **separate** token, not the Steam key. Reusing the key across
 /// purposes would put a Valve credential on the wire for something that has nothing to do with Valve.
-async fn publish_artifact(bytes: &[u8]) {
+async fn publish_artifact(name: &str, bytes: &[u8]) {
     let base = std::env::var("VAPOUR_RELAY")
         .unwrap_or_else(|_| DEFAULT_RELAY.to_string());
     let token = match std::env::var("VAPOUR_TOKEN") {
@@ -590,7 +666,7 @@ async fn publish_artifact(bytes: &[u8]) {
             std::process::exit(2);
         }
     };
-    let url = format!("{}/artifact/servers", base.trim_end_matches('/'));
+    let url = format!("{}/artifact/{name}", base.trim_end_matches('/'));
 
     let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build() {
         Ok(client) => client,

@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 
 /// From the protocol: a split reply is at most 16 packets, and no honest reply is near this large.
@@ -34,7 +34,7 @@ const TYPE_RULES: u8 = 0x45; // 'E'
 const TYPE_CHALLENGE: u8 = 0x41; // 'A'
 
 /// What a server says about itself.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Info {
     pub name: String,
     pub map: String,
@@ -57,7 +57,7 @@ pub struct Info {
 }
 
 /// One mod as the server advertises it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
     /// Steam Workshop id, or 0 for a mod that is not published there.
     pub workshop_id: u64,
@@ -65,7 +65,7 @@ pub struct Mod {
 }
 
 /// The DayZ payload inside `A2S_RULES`.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DayzPayload {
     pub protocol_version: u8,
     /// False when the server flagged an overflow: its own list did not fit and is cut short.
@@ -84,7 +84,7 @@ pub struct Rules {
 }
 
 /// A raw result for one address, in the shape the artifact publishes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reading {
     pub addr: String,
     /// True when the server answered at all.
@@ -107,6 +107,43 @@ impl Reading {
             return false;
         };
         info.bots == 0 && info.max_players <= 127
+    }
+}
+
+/// What the servers themselves said, collected into something the filter can consult.
+#[derive(Debug, Default)]
+pub struct Verdicts {
+    /// When the readings were published, for deciding whether they can be trusted at all.
+    pub at: u64,
+    /// Per address: bots claimed, whether it answered, and how many players it had.
+    readings: std::collections::HashMap<String, (u8, bool, u8)>,
+}
+
+/// Readings older than this are treated as no reading. A stale verdict must never cost a server.
+const VERDICT_LIFETIME_SECONDS: u64 = 60 * 60;
+
+impl Verdicts {
+    pub fn from_readings(readings: &[Reading], at: u64) -> Self {
+        let mut by_addr = std::collections::HashMap::with_capacity(readings.len());
+        for reading in readings {
+            let bots = reading.info.as_ref().map(|info| info.bots).unwrap_or(0);
+            let players = reading.info.as_ref().map(|info| info.players).unwrap_or(0);
+            by_addr.insert(reading.addr.clone(), (bots, reading.answered, players));
+        }
+        Self { at, readings: by_addr }
+    }
+
+    /// Whether this is recent enough to act on.
+    pub fn fresh(&self, now: u64) -> bool {
+        now.saturating_sub(self.at) <= VERDICT_LIFETIME_SECONDS
+    }
+
+    pub fn get(&self, addr: &str) -> Option<(u8, bool, u8)> {
+        self.readings.get(addr).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.readings.len()
     }
 }
 

@@ -1,0 +1,61 @@
+# The fast clock: ask the servers themselves.
+#
+# This is the job the whole design hangs on. Valve's master list cannot tell a farm from a hosting
+# company, and no amount of analysis of it will change that. What a server cannot fake is answering as
+# itself, which is what this pass collects: live players, the bots count, and the mod list.
+#
+# It never touches Valve. It reads the published list from the relay and sends UDP queries to the
+# servers in it, so there is no quota, no key, and no throttle — and it can therefore run every fifteen
+# minutes, which is the freshness the launcher was always supposed to have.
+#
+# Its output is a second artifact, `/artifact/a2s`, which the slow sweep reads back when it publishes:
+# servers reporting bots are dropped as fabricated, and servers that did not answer are marked offline
+# and kept rather than deleted.
+
+name: a2s
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a2s
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ask every server
+        env:
+          VAPOUR_RELAY: https://dayz-vapour-relay.chrisplayer.workers.dev
+          VAPOUR_TOKEN: ${{ secrets.VAPOUR_UPLOAD_TOKEN }}
+        run: |
+          if [ -z "$VAPOUR_TOKEN" ]; then
+            echo "::error::VAPOUR_UPLOAD_TOKEN is not set, so results cannot be published."
+            exit 1
+          fi
+          cargo run --release --quiet -- \
+            --a2s --publish \
+            --concurrency 384 \
+            --out a2s.json.gz
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f a2s.json.gz ]; then
+            echo "readings: $(stat -c%s a2s.json.gz) bytes" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no readings were produced" >> "$GITHUB_STEP_SUMMARY"
+          fi
