@@ -13,10 +13,13 @@
 //! cargo run -- --out servers.json.gz
 //! ```
 
+mod a2s;
 mod cluster;
 mod steam;
 
-use std::io::Write;
+use std::io::{Read, Write};
+
+use futures::StreamExt;
 
 use cluster::{ClusterIndex, ReasonKind, Verdict};
 use steam::{Enumerated, GameServer, Sweep, Transport};
@@ -63,6 +66,151 @@ struct HiddenRow<'a> {
     borrowed_names: usize,
 }
 
+/// The published list, as read back for the A2S pass.
+#[derive(serde::Deserialize)]
+struct PublishedList {
+    #[serde(default)]
+    servers: Vec<PublishedRow>,
+}
+
+#[derive(serde::Deserialize)]
+struct PublishedRow {
+    server: GameServer,
+}
+
+/// Query every server in the published list, and report what answers.
+///
+/// This is the farm signal as much as the mod signal. A server that answers as itself cannot hide what
+/// it runs, and a cluster sharing a mod list, a slot count and a name prefix is visible here and
+/// nowhere in Valve's list.
+async fn run_a2s(args: &[String]) -> Result<(), String> {
+    fn value<'a>(args: &'a [String], name: &str) -> Option<&'a String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1))
+    }
+    fn number(args: &[String], name: &str, fallback: usize) -> usize {
+        value(args, name).and_then(|v| v.parse().ok()).unwrap_or(fallback)
+    }
+
+    let concurrency = number(args, "--concurrency", 128).max(1);
+    let limit = number(args, "--limit", usize::MAX);
+    let out = value(args, "--out").cloned();
+    let from = value(args, "--from").cloned();
+
+    // The list comes from a local artifact when given one, otherwise from the relay.
+    let raw = match from {
+        Some(path) => std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?,
+        None => {
+            let base = std::env::var("VAPOUR_RELAY").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+            let url = format!("{}/artifact/servers", base.trim_end_matches('/'));
+            let response = reqwest::get(&url).await.map_err(|e| format!("{url}: {e}"))?;
+            if !response.status().is_success() {
+                return Err(format!("{url}: HTTP {}", response.status()));
+            }
+            response
+                .bytes()
+                .await
+                .map_err(|e| format!("{url}: {e}"))?
+                .to_vec()
+        }
+    };
+
+    let json = if raw.starts_with(&[0x1f, 0x8b]) {
+        let mut text = Vec::new();
+        flate2::read::GzDecoder::new(&raw[..])
+            .read_to_end(&mut text)
+            .map_err(|e| format!("the list is not readable gzip: {e}"))?;
+        text
+    } else {
+        raw
+    };
+
+    let published: PublishedList =
+        serde_json::from_slice(&json).map_err(|e| format!("the list is not the shape we expect: {e}"))?;
+    let addrs: Vec<String> = published
+        .servers
+        .iter()
+        .take(limit)
+        .map(|row| row.server.addr.clone())
+        .collect();
+
+    println!("probing    : {} servers, {concurrency} at a time", addrs.len());
+    let client = a2s::Client::new(std::time::Duration::from_secs(3));
+    let client = &client;
+    let started = std::time::Instant::now();
+
+    // Owns each address and borrows the client: a reference is copyable, so the futures stay 'static
+    // enough for the stream without cloning a socket per task.
+    let readings: Vec<a2s::Reading> = futures::stream::iter(
+        addrs.into_iter().map(|addr| async move { client.read(&addr).await }),
+    )
+    .buffer_unordered(concurrency)
+    .collect()
+    .await;
+
+    println!("elapsed    : {:.1} s", started.elapsed().as_secs_f32());
+
+    let answered = readings.iter().filter(|r| r.answered).count();
+    let bots = readings
+        .iter()
+        .filter(|r| r.info.as_ref().is_some_and(|i| i.bots > 0))
+        .count();
+    let impossible = readings
+        .iter()
+        .filter(|r| r.info.as_ref().is_some_and(|i| i.max_players > 127))
+        .count();
+    let busy = readings
+        .iter()
+        .filter(|r| r.info.as_ref().is_some_and(|i| i.players > 0))
+        .count();
+    let with_mods = readings.iter().filter(|r| r.mods.as_ref().is_some_and(|m| !m.mods.is_empty())).count();
+    let partial = readings.iter().filter(|r| r.mods.as_ref().is_some_and(|m| !m.complete)).count();
+
+    println!("answered   : {answered} of {}", readings.len());
+    println!(
+        "plausible  : {}   (answered, no bots, slots the engine can honour)",
+        readings.iter().filter(|r| r.is_plausible()).count()
+    );
+    println!("bots > 0   : {bots}   (fabricated — DayZ has none)");
+    println!("slots >127 : {impossible}   (impossible)");
+    println!("players > 0: {busy}");
+    println!("with mods  : {with_mods}   ({partial} flagged their list incomplete)");
+
+    // The mods everyone shares: the signal that a cluster is one server wearing many ports.
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for reading in &readings {
+        if let Some(mods) = &reading.mods {
+            for entry in &mods.mods {
+                *counts.entry(entry.name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut top: Vec<(&String, &usize)> = counts.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(a.1));
+    println!(
+        "top mods   : {}",
+        top.iter()
+            .take(6)
+            .map(|(name, count)| format!("{name} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    if let Some(path) = out {
+        let json = serde_json::to_vec(&readings).map_err(|e| e.to_string())?;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&json).map_err(|e| e.to_string())?;
+        let bytes = encoder.finish().map_err(|e| e.to_string())?;
+        std::fs::write(&path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+        println!(
+            "wrote      : {path}  ({:.1} KB raw, {:.1} KB gzipped)",
+            json.len() as f32 / 1024.0,
+            bytes.len() as f32 / 1024.0
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct SweepStats {
     requests: usize,
@@ -106,6 +254,18 @@ async fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(12_000);
     let publish = args.iter().any(|a| a == "--publish");
+
+    // The A2S pass: queries the published list and reports what answers. No Valve involvement, so it
+    // runs on its own clock later; here it is a mode so the data can be gathered and looked at now.
+    if args.iter().any(|a| a == "--a2s") {
+        match run_a2s(&args).await {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Optional diagnostic: write every hidden row, with the profile that condemned it, as JSON lines.
     let dump_hidden = args
