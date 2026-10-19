@@ -422,25 +422,16 @@ async fn main() {
         let ip = steam::ip_of(&server.addr);
         outcome.entry(ip).or_insert((assessment.kind, assessment.hide));
 
-        // What the server itself said, when the reading is recent enough to act on. This is the one
-        // signal Valve's list cannot give: a master row's `bots` field just mirrors its players, while
-        // a server that answers a query with bots is telling on itself. DayZ has no bots.
+        // Verdicts from the A2S pass are evidence, not sentence. The bots count was tried as a hard
+        // filter and abandoned: a hosting provider's customers running AI/PvE servers report exactly
+        // the same shape as a farm, and 232 of KarmaKrew's 279 servers matched it. So the only thing
+        // taken from a reading is whether the server answered — the rest travels in the artifact for
+        // the client to show and the player to filter.
         let verdict = verdicts
             .as_ref()
             .filter(|v| v.fresh(now))
             .and_then(|v| v.get(&server.addr));
         let online = verdict.map(|(_, answered, _)| answered);
-
-        if let Some((bots, _, _)) = verdict
-            && bots > 0
-        {
-            hidden += 1;
-            *by_kind.entry(ReasonKind::Bots).or_insert(0) += 1;
-            if !flood.contains(ip) {
-                *ordinary.entry(ReasonKind::Bots).or_insert(0) += 1;
-            }
-            continue;
-        }
 
         match assessment.verdict {
             Verdict::Clean => clean += 1,

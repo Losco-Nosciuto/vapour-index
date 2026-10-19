@@ -88,8 +88,6 @@ pub enum Verdict {
 pub enum ReasonKind {
     /// More slots than the engine allows, or more players than slots.
     Arithmetic,
-    /// The server reported bots. DayZ has none, so the process has been modified.
-    Bots,
     /// Several servers on one address - badged, never hidden.
     SeveralOnOneAddress,
     /// Nothing unexplained.
@@ -100,7 +98,6 @@ impl ReasonKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Arithmetic => "arithmetic",
-            Self::Bots => "bots",
             Self::SeveralOnOneAddress => "several-on-one-address",
             Self::None => "none",
         }
