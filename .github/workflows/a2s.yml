@@ -18,6 +18,15 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      limit:
+        description: "Probe only this many servers (empty = all)"
+        required: false
+        default: ""
+      concurrency:
+        description: "Queries in flight at once"
+        required: false
+        default: "384"
 
 permissions:
   contents: read
@@ -41,15 +50,22 @@ jobs:
         env:
           VAPOUR_RELAY: https://dayz-vapour-relay.chrisplayer.workers.dev
           VAPOUR_TOKEN: ${{ secrets.VAPOUR_UPLOAD_TOKEN }}
+          LIMIT: ${{ inputs.limit }}
+          CONCURRENCY: ${{ inputs.concurrency }}
         run: |
           if [ -z "$VAPOUR_TOKEN" ]; then
             echo "::error::VAPOUR_UPLOAD_TOKEN is not set, so results cannot be published."
             exit 1
           fi
+          extra=()
+          if [ -n "$LIMIT" ]; then
+            extra+=(--limit "$LIMIT")
+          fi
           cargo run --release --quiet -- \
             --a2s --publish \
-            --concurrency 384 \
-            --out a2s.json.gz
+            --concurrency "${CONCURRENCY:-384}" \
+            --out a2s.json.gz \
+            "${extra[@]}"
 
       - name: Summary
         if: always()

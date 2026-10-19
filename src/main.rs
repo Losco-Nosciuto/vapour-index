@@ -128,6 +128,7 @@ async fn run_a2s(args: &[String], publish: bool) -> Result<(), String> {
 
     let concurrency = number(args, "--concurrency", 128).max(1);
     let limit = number(args, "--limit", usize::MAX);
+    let skip = number(args, "--skip", 0);
     let out = value(args, "--out").cloned();
     let from = value(args, "--from").cloned();
 
@@ -164,11 +165,12 @@ async fn run_a2s(args: &[String], publish: bool) -> Result<(), String> {
     let addrs: Vec<String> = published
         .servers
         .iter()
+        .skip(skip)
         .take(limit)
         .map(|row| row.server.addr.clone())
         .collect();
 
-    println!("probing    : {} servers, {concurrency} at a time", addrs.len());
+    println!("probing    : {} servers from offset {skip}, {concurrency} at a time", addrs.len());
     let client = a2s::Client::new(std::time::Duration::from_secs(3));
     let client = &client;
     let started = std::time::Instant::now();
