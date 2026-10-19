@@ -15,8 +15,10 @@
 name: a2s
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
+  # Deliberately unscheduled. GitHub runners answer only 7-36% of A2S queries (UDP is dropped
+  # on their network), so a scheduled pass publishes a thin reading that then silently disables
+  # the fabrication rule downstream, because a server with no reading cannot be judged. This must
+  # run from a host that can do UDP; until there is one, it is manual only.
   workflow_dispatch:
     inputs:
       limit:
