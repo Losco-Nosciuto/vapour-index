@@ -41,6 +41,10 @@ const TYPE_CHALLENGE: u8 = 0x41; // 'A'
 /// that, in its own reply.
 const REQUEST_PLAYERS: u8 = 0x55; // 'U'
 
+/// The player query gets a short leash: a real server answers in under 100 ms, and a pad never answers
+/// at all. Waiting three seconds for each of sixty thousand silent servers was most of a full pass.
+const PLAYERS_BUDGET: Duration = Duration::from_millis(900);
+
 /// What a server says about itself.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Info {
@@ -596,7 +600,7 @@ impl Client {
     }
 
     /// Sends one request and collects a whole reply.
-    async fn ask(&self, addr: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    async fn ask(&self, addr: &str, payload: &[u8], budget: Duration) -> Result<Vec<u8>, String> {
         let target = socket_addr(addr)?;
         let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
 
@@ -607,10 +611,10 @@ impl Client {
         let mut assembler = Assembler::default();
         loop {
             let mut buffer = [0u8; MAX_DATAGRAM];
-            let read = match tokio::time::timeout(self.timeout, socket.recv(&mut buffer)).await {
+            let read = match tokio::time::timeout(budget, socket.recv(&mut buffer)).await {
                 Ok(Ok(n)) => n,
                 Ok(Err(e)) => return Err(format!("{addr}: recv: {e}")),
-                Err(_) => return Err(format!("{addr}: no reply in {:?}", self.timeout)),
+                Err(_) => return Err(format!("{addr}: no reply in {budget:?}")),
             };
             if let Some(body) = assembler.push(&buffer[..read])? {
                 return Ok(body);
@@ -623,7 +627,7 @@ impl Client {
         let mut challenge = None;
         // Servers answer the first request with a challenge, and a rare one asks twice.
         for _ in 0..3 {
-            let body = self.ask(addr, &info_request(challenge)).await?;
+            let body = self.ask(addr, &info_request(challenge), self.timeout).await?;
             match body.first().copied() {
                 Some(TYPE_INFO) => return parse_info(&body),
                 Some(TYPE_CHALLENGE) if body.len() >= 5 => {
@@ -639,7 +643,7 @@ impl Client {
     pub async fn rules(&self, addr: &str) -> Result<Rules, String> {
         let mut challenge = None;
         for _ in 0..3 {
-            let body = self.ask(addr, &rules_request(challenge)).await?;
+            let body = self.ask(addr, &rules_request(challenge), self.timeout).await?;
             match body.first().copied() {
                 Some(TYPE_RULES) => return parse_rules(&body),
                 Some(TYPE_CHALLENGE) if body.len() >= 5 => {
@@ -655,7 +659,7 @@ impl Client {
     pub async fn named_players(&self, addr: &str) -> Option<u16> {
         let mut challenge = None;
         for _ in 0..3 {
-            let body = self.ask(addr, &players_request(challenge)).await.ok()?;
+            let body = self.ask(addr, &players_request(challenge), PLAYERS_BUDGET).await.ok()?;
             match body.first().copied() {
                 Some(TYPE_PLAYERS) => return parse_player_count(&body).ok(),
                 Some(TYPE_CHALLENGE) if body.len() >= 5 => {
