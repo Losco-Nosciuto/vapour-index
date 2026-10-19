@@ -171,7 +171,11 @@ pub struct Verdicts {
 }
 
 /// Readings older than this are treated as no reading. A stale verdict must never cost a server.
-const VERDICT_LIFETIME_SECONDS: u64 = 60 * 60;
+///
+/// Six hours rather than one: the sweep itself can take an hour, and a verdict that expires while the
+/// sweep it belongs to is still running would quietly switch the rule off. What matters is that the
+/// reading is recent relative to the servers changing behaviour, not relative to a stopwatch.
+const VERDICT_LIFETIME_SECONDS: u64 = 6 * 60 * 60;
 
 impl Verdicts {
     /// Builds from the compact form the producer publishes for clients.
