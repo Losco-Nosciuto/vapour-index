@@ -88,7 +88,9 @@ pub enum Verdict {
 pub enum ReasonKind {
     /// More slots than the engine allows, or more players than slots.
     Arithmetic,
-    /// Several servers on one address - badged, never hidden.
+    /// A population that is entirely bots, names none of them, and has no queue.
+    Fabricated,
+    /// Several servers on one address - information, never a verdict.
     SeveralOnOneAddress,
     /// Nothing unexplained.
     None,
@@ -98,6 +100,7 @@ impl ReasonKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Arithmetic => "arithmetic",
+            Self::Fabricated => "fabricated",
             Self::SeveralOnOneAddress => "several-on-one-address",
             Self::None => "none",
         }

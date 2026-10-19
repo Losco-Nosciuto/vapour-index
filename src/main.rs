@@ -91,6 +91,8 @@ struct CompactVerdict {
     p: u8,
     b: u8,
     ok: bool,
+    n: Option<u16>,
+    q: Option<u16>,
 }
 
 /// Reads what the A2S pass last published, stamped with the relay's idea of when.
@@ -121,7 +123,12 @@ async fn load_verdicts(relay: &str) -> Option<a2s::Verdicts> {
 
     let entries: Vec<CompactVerdict> = serde_json::from_slice(&json).ok()?;
     Some(a2s::Verdicts::from_entries(
-        entries.into_iter().map(|v| (v.a, v.b, v.ok, v.p)),
+        entries.into_iter().map(|v| {
+            (
+                v.a,
+                a2s::Verdict { bots: v.b, answered: v.ok, players: v.p, queue: v.q, named: v.n },
+            )
+        }),
         at,
     ))
 }
@@ -165,6 +172,7 @@ async fn run_a2s(args: &[String], publish: bool) -> Result<(), String> {
     let concurrency = number(args, "--concurrency", 128).max(1);
     let limit = number(args, "--limit", usize::MAX);
     let skip = number(args, "--skip", 0);
+    let only_name = value(args, "--only-name").map(|name| name.to_lowercase());
     let out = value(args, "--out").cloned();
     let from = value(args, "--from").cloned();
 
@@ -201,6 +209,11 @@ async fn run_a2s(args: &[String], publish: bool) -> Result<(), String> {
     let addrs: Vec<String> = published
         .servers
         .iter()
+        .filter(|row| {
+            only_name
+                .as_ref()
+                .is_none_or(|needle| row.server.name.to_lowercase().contains(needle))
+        })
         .skip(skip)
         .take(limit)
         .map(|row| row.server.addr.clone())
@@ -294,6 +307,8 @@ async fn run_a2s(args: &[String], publish: bool) -> Result<(), String> {
             p: u8,
             b: u8,
             ok: bool,
+            n: Option<u16>,
+            q: Option<u16>,
         }
         let lines: Vec<Line> = readings
             .iter()
@@ -302,6 +317,8 @@ async fn run_a2s(args: &[String], publish: bool) -> Result<(), String> {
                 p: reading.info.as_ref().map(|info| info.players).unwrap_or(0),
                 b: reading.info.as_ref().map(|info| info.bots).unwrap_or(0),
                 ok: reading.answered,
+                n: reading.named_players,
+                q: reading.queue,
             })
             .collect();
 
@@ -513,16 +530,27 @@ async fn main() {
         let ip = steam::ip_of(&server.addr);
         outcome.entry(ip).or_insert((assessment.kind, assessment.hide));
 
-        // Verdicts from the A2S pass are evidence, not sentence. The bots count was tried as a hard
-        // filter and abandoned: a hosting provider's customers running AI/PvE servers report exactly
-        // the same shape as a farm, and 232 of KarmaKrew's 279 servers matched it. So the only thing
-        // taken from a reading is whether the server answered — the rest travels in the artifact for
-        // the client to show and the player to filter.
+        // Verdicts from the A2S pass. One rule acts on them, and only one: a population made entirely
+        // of bots, naming none of them, with no queue. Everything else a reading says travels to the
+        // client as information. The bots count alone was tried and failed — it flagged 232 of
+        // KarmaKrew's 279 real servers — so the question "who is actually in there?" is the one that
+        // decides, and only when all three facts agree.
         let verdict = verdicts
             .as_ref()
             .filter(|v| v.fresh(now))
             .and_then(|v| v.get(&server.addr));
-        let online = verdict.map(|(_, answered, _)| answered);
+        let online = verdict.map(|v| v.answered);
+
+        if let Some(v) = verdict
+            && v.fabricated()
+        {
+            hidden += 1;
+            *by_kind.entry(ReasonKind::Fabricated).or_insert(0) += 1;
+            if !flood.contains(ip) {
+                *ordinary.entry(ReasonKind::Fabricated).or_insert(0) += 1;
+            }
+            continue;
+        }
 
         match assessment.verdict {
             Verdict::Clean => clean += 1,

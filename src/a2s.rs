@@ -31,7 +31,15 @@ const HEADER_SINGLE: i32 = -1; // 0xFFFFFFFF
 const HEADER_SPLIT: i32 = -2; // 0xFFFFFFFE
 const TYPE_INFO: u8 = 0x49; // 'I'
 const TYPE_RULES: u8 = 0x45; // 'E'
+const TYPE_PLAYERS: u8 = 0x44; // 'D'
 const TYPE_CHALLENGE: u8 = 0x41; // 'A'
+
+/// `A2S_PLAYERS`: the list of names actually in the server.
+///
+/// The one query that cannot be answered dishonestly without exposing the lie elsewhere. A server that
+/// claims ninety players and cannot name one is not full, it is full of bots — and it reports exactly
+/// that, in its own reply.
+const REQUEST_PLAYERS: u8 = 0x55; // 'U'
 
 /// What a server says about itself.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,6 +101,18 @@ pub struct Reading {
     pub info: Option<Info>,
     /// Populated when it answered with A2S_RULES and a DayZ payload could be decoded.
     pub mods: Option<DayzPayload>,
+    /// The login queue length from the rules reply, when the server publishes one.
+    ///
+    /// A genuinely full server has a queue; a pad claiming capacity has nobody to queue, so it reports
+    /// zero — or publishes nothing at all. Absent is treated as unknown, never as zero.
+    pub queue: Option<u16>,
+
+    /// How many names `A2S_PLAYERS` returned, when the server answered it at all.
+    ///
+    /// `None` means the question was refused or lost — not that the server is empty. A server that
+    /// answers with zero names while claiming players is contradicting itself, and that is the whole
+    /// point of asking.
+    pub named_players: Option<u16>,
     /// Why it was not readable, when it was not.
     pub error: Option<String>,
 }
@@ -110,37 +130,62 @@ impl Reading {
     }
 }
 
+/// What one server said about itself.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Verdict {
+    pub bots: u8,
+    pub answered: bool,
+    pub players: u8,
+    /// Login queue length; `None` when the server publishes none, i.e. unknown.
+    pub queue: Option<u16>,
+    /// Names `A2S_PLAYERS` returned; `None` when the question was refused or lost.
+    pub named: Option<u16>,
+}
+
+impl Verdict {
+    /// A population made entirely of bots, which the server also refuses to name.
+    ///
+    /// Deliberately asymmetric, because the signals are:
+    ///
+    /// - **A queue means it is real.** Nobody queues for a server that does not exist, so any queue
+    ///   vetoes this rule outright, whatever else is true. It is never *required*: a small server can
+    ///   be full with nobody waiting, and that says nothing about whether it exists.
+    /// - **A refusal to name players is evidence.** Real servers answer the player query even when they
+    ///   have zero names to give (they disabled it, and say so); a pad claiming ninety players and
+    ///   returning no reply at all is hiding the fact that it cannot name one.
+    /// - **A population entirely of bots** corroborates it. A real server reports its humans.
+    pub fn fabricated(&self) -> bool {
+        if self.queue.is_some_and(|queued| queued > 0) {
+            return false;
+        }
+        self.bots > 0 && self.bots == self.players && self.named.is_none()
+    }
+}
+
 /// What the servers themselves said, collected into something the filter can consult.
 #[derive(Debug, Default)]
 pub struct Verdicts {
     /// When the readings were published, for deciding whether they can be trusted at all.
     pub at: u64,
-    /// Per address: bots claimed, whether it answered, and how many players it had.
-    readings: std::collections::HashMap<String, (u8, bool, u8)>,
+    readings: std::collections::HashMap<String, Verdict>,
 }
 
 /// Readings older than this are treated as no reading. A stale verdict must never cost a server.
 const VERDICT_LIFETIME_SECONDS: u64 = 60 * 60;
 
 impl Verdicts {
+    /// Builds from the compact form the producer publishes for clients.
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, Verdict)>, at: u64) -> Self {
+        Self { at, readings: entries.into_iter().collect() }
+    }
+
     /// Whether this is recent enough to act on.
     pub fn fresh(&self, now: u64) -> bool {
         now.saturating_sub(self.at) <= VERDICT_LIFETIME_SECONDS
     }
 
-    pub fn get(&self, addr: &str) -> Option<(u8, bool, u8)> {
+    pub fn get(&self, addr: &str) -> Option<Verdict> {
         self.readings.get(addr).copied()
-    }
-
-    /// Builds from the compact form the producer publishes for clients: bots, answered, players.
-    pub fn from_entries(entries: impl IntoIterator<Item = (String, u8, bool, u8)>, at: u64) -> Self {
-        Self {
-            at,
-            readings: entries
-                .into_iter()
-                .map(|(addr, bots, answered, players)| (addr, (bots, answered, players)))
-                .collect(),
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -175,6 +220,41 @@ fn rules_request(challenge: Option<[u8; 4]>) -> Vec<u8> {
         None => out.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
     }
     out
+}
+
+/// Builds an `A2S_PLAYERS` request. The first one carries the placeholder, answered with a challenge.
+fn players_request(challenge: Option<[u8; 4]>) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFF, 0xFF, 0xFF, REQUEST_PLAYERS];
+    match challenge {
+        Some(c) => out.extend_from_slice(&c),
+        None => out.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
+    }
+    out
+}
+
+/// Counts the names in an `A2S_PLAYERS` reply.
+///
+/// The body is a byte count followed by that many entries of (index, name, score, duration). Only the
+/// names matter; the rest is skipped by length so a short or malformed reply yields the entries it can
+/// account for rather than nonsense.
+pub fn parse_player_count(body: &[u8]) -> Result<u16, String> {
+    if body.first() != Some(&TYPE_PLAYERS) {
+        return Err(format!("not a players reply (type {:?})", body.first()));
+    }
+    let claimed = *body.get(1).ok_or("players reply truncated")?;
+    let mut r = Reader::new(&body[2..]);
+    let mut named = 0u16;
+    for _ in 0..claimed {
+        let Ok(_index) = r.u8() else { break };
+        let Ok(name) = r.cbytes() else { break };
+        if r.skip(8).is_err() {
+            break;
+        }
+        if !name.is_empty() {
+            named += 1;
+        }
+    }
+    Ok(named)
 }
 
 /// Reassembles split replies, refusing anything that looks wrong rather than trusting it.
@@ -567,19 +647,44 @@ impl Client {
         Err(format!("{addr}: kept asking for a challenge"))
     }
 
+    /// Asks a server who is in it. `None` when it refuses or the question is lost.
+    pub async fn named_players(&self, addr: &str) -> Option<u16> {
+        let mut challenge = None;
+        for _ in 0..3 {
+            let body = self.ask(addr, &players_request(challenge)).await.ok()?;
+            match body.first().copied() {
+                Some(TYPE_PLAYERS) => return parse_player_count(&body).ok(),
+                Some(TYPE_CHALLENGE) if body.len() >= 5 => {
+                    challenge = Some([body[1], body[2], body[3], body[4]]);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Everything worth having from one server, in one reading.
     pub async fn read(&self, addr: &str) -> Reading {
         match self.info(addr).await {
             Ok(info) => {
-                let mods = match self.rules(addr).await {
-                    Ok(rules) => rules.dayz,
-                    Err(_) => None,
+                let (mods, queue) = match self.rules(addr).await {
+                    Ok(rules) => {
+                        let queue = rules
+                            .rules
+                            .get("lqs")
+                            .and_then(|value| value.trim().parse::<u16>().ok());
+                        (rules.dayz, queue)
+                    }
+                    Err(_) => (None, None),
                 };
+                let named_players = self.named_players(addr).await;
                 Reading {
                     addr: addr.to_string(),
                     answered: true,
                     info: Some(info),
                     mods,
+                    queue,
+                    named_players,
                     error: None,
                 }
             }
@@ -588,6 +693,8 @@ impl Client {
                 answered: false,
                 info: None,
                 mods: None,
+                queue: None,
+                named_players: None,
                 error: Some(error),
             },
         }
