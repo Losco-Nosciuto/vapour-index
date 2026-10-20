@@ -266,13 +266,15 @@ impl ClusterIndex {
     }
 }
 
-/// The identity of a server for the purposes of collapsing bulk duplication: its machine and its name.
+/// The identity of a server for the purposes of collapsing copies: its name.
 ///
-/// One machine announcing the same name on two thousand ports is one server with a lot of noise, not
-/// two thousand servers. Collapsing on this key removes the noise without deciding that any name is
-/// fake — which is the point, because nowhere in this file is there a rule that erases a name.
-pub fn dedup_key(server: &GameServer) -> (String, String) {
-    (ip_of(&server.addr).to_string(), server.name.trim().to_string())
+/// Keying on (machine, name) was wrong for the real shape of the flood. A copy is the same name on a
+/// *different* machine, so that key left eighteen rows of "DayOne Nasdara 1PP" and twenty of "KarmaKrew
+/// Nasdara #4" in the list — exactly the crowding the other launchers do not have. They publish one row
+/// per name, and so do we. Which instance is shown is decided by evidence in the producer: a queue
+/// first, then a named population, then the busiest.
+pub fn name_key(server: &GameServer) -> String {
+    server.name.trim().to_lowercase()
 }
 
 #[cfg(test)]
@@ -382,27 +384,33 @@ mod tests {
     }
 
     #[test]
-    fn bulk_duplication_collapses_on_machine_and_name() {
+    fn one_row_per_name_is_what_ships() {
         use std::collections::HashSet;
 
-        // A farm: one machine, three names, each announced on hundreds of ports. Collapsing keeps one
-        // entry per name, so 1,200 rows become 3 without erasing anything.
+        // A farm: three names, each announced on hundreds of ports across several machines. Keying on the
+        // name keeps one row per name, so 1,200 rows become 3 without erasing anything — and, crucially,
+        // it collapses the copies that sit on *different* machines, which the old key could not.
         let mut servers = Vec::new();
-        for port in 0..400 {
-            for (offset, name) in [(2000, "Farm A"), (6000, "Farm B"), (10000, "Farm C")] {
-                servers.push(server(&format!("9.9.9.9:{}", offset + port), name));
+        for machine in 0..4 {
+            for port in 0..100 {
+                for (offset, name) in [(2000, "Farm A"), (6000, "Farm B"), (10000, "Farm C")] {
+                    servers.push(server(
+                        &format!("9.9.{machine}.9:{}", offset + port),
+                        name,
+                    ));
+                }
             }
         }
-        let kept: HashSet<(String, String)> = servers.iter().map(dedup_key).collect();
+        let kept: HashSet<String> = servers.iter().map(name_key).collect();
         assert_eq!(kept.len(), 3);
         assert_eq!(servers.len(), 1200);
 
-        // And a community's fifty-three differently-named servers on one machine survive untouched:
-        // the key is per name, so nothing about running many servers is itself suspicious.
+        // And a community's fifty-three differently-named servers survive as fifty-three rows, wherever
+        // they run: nothing about running many servers is itself a reason to collapse anything.
         let community: Vec<GameServer> = (0..53)
             .map(|i| server(&format!("185.83.152.170:{}", 2303 + i), &format!("[STPC] Server {i}")))
             .collect();
-        let community_keys: HashSet<(String, String)> = community.iter().map(dedup_key).collect();
+        let community_keys: HashSet<String> = community.iter().map(name_key).collect();
         assert_eq!(community_keys.len(), 53);
     }
 

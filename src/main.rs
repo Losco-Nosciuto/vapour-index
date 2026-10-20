@@ -73,6 +73,14 @@ struct HiddenRow<'a> {
     borrowed_names: usize,
 }
 
+/// One candidate for a name, with the evidence that decides which instance is shown.
+struct Ranked {
+    rank: u8,
+    queue: u16,
+    players: u8,
+    published: Published,
+}
+
 /// The published list, as read back for the A2S pass.
 #[derive(serde::Deserialize)]
 struct PublishedList {
@@ -521,9 +529,6 @@ async fn main() {
         std::collections::HashMap::new();
     let mut hidden_rows: Vec<HiddenRow> = Vec::new();
     // One entry per machine and name: the flood collapses here instead of being judged.
-    let mut seen_identities: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
-    let mut collapsed = 0usize;
 
     for server in &merged {
         let assessment = index.assess(server);
@@ -581,21 +586,49 @@ async fn main() {
             continue;
         }
 
-        // Collapse bulk duplication: one entry per machine and name. A farm announcing fifty names on
-        // two thousand ports becomes fifty entries, while a community running fifty differently-named
-        // servers on one box is untouched. No name is erased — which is why this is a collapse rather
-        // than one more reason to hide.
-        if !seen_identities.insert(cluster::dedup_key(server)) {
-            collapsed += 1;
-            continue;
-        }
+        // One entry per name, chosen by evidence rather than by arrival order.
+        //
+        // This is the collapse that matters. A copy is the same name on a different machine, so keying on
+        // (machine, name) left — for example — eighteen rows of "DayOne Nasdara 1PP" and twenty of
+        // "KarmaKrew Nasdara #4", which is exactly the crowding the other launchers don't have. They
+        // publish one row per name; so do we. Every instance is kept in the artifact; only the best one
+        // occupies the list.
+        let queue = verdict.and_then(|v| v.queue).unwrap_or(0);
+        let named = verdict.and_then(|v| v.named);
+        // Queue first (proof of real demand), then a named population, then the busiest.
+        let rank = (queue > 0) as u8 * 4 + named.is_some() as u8 * 2 + online.unwrap_or(false) as u8;
 
-        servers.push(Published {
-            server: server.clone(),
-            verdict: assessment.verdict,
-            reasons: assessment.reasons,
-            online,
+        servers.push(Ranked {
+            rank,
+            queue,
+            players: verdict.map(|v| v.players).unwrap_or(server.players as u8),
+            published: Published {
+                server: server.clone(),
+                verdict: assessment.verdict,
+                reasons: assessment.reasons,
+                online,
+            },
         });
+    }
+
+    // Keep the best instance of each name, and count the rest as collapsed rather than dropped.
+    let ranked_total = servers.len();
+    let mut best: std::collections::HashMap<String, Ranked> = std::collections::HashMap::new();
+    for candidate in servers {
+        let key = cluster::name_key(&candidate.published.server);
+        match best.get(&key) {
+            Some(existing)
+                if (existing.rank, existing.queue, existing.players)
+                    >= (candidate.rank, candidate.queue, candidate.players) => {}
+            _ => {
+                best.insert(key, candidate);
+            }
+        }
+    }
+    let by_name = ranked_total - best.len();
+    let mut servers: Vec<Published> = Vec::with_capacity(best.len());
+    for (_, candidate) in best {
+        servers.push(candidate.published);
     }
 
     let names: std::collections::HashSet<&str> =
@@ -634,7 +667,7 @@ async fn main() {
         );
     }
     println!("published  : {} of {} listings", servers.len(), merged.len());
-    println!("collapsed  : {collapsed} duplicate announcements (same machine, same name)");
+    println!("collapsed  : {by_name} instances of a name already shown (one row per name ships)");
     println!(
         "names      : {} seen, {} published, {} never published",
         names.len(),
