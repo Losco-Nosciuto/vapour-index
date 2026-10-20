@@ -327,6 +327,14 @@ impl<'a> Sweep<'a> {
         }
     }
 
+    /// One query for a caller that knows exactly what it wants.
+    ///
+    /// Same retries and throttling behaviour as the ladder, exposed so the watchlist can ask for a
+    /// specific community by name instead of hoping a crowded bucket samples it.
+    pub async fn fetch_named(&self, filter: &str) -> Option<Vec<GameServer>> {
+        self.fetch(filter).await.ok()
+    }
+
     /// One filter, retried properly if Valve throttled it.
     ///
     /// Every attempt varies the row limit, which is part of the relay's cache key — otherwise a retry

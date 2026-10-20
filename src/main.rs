@@ -450,6 +450,31 @@ async fn main() {
     };
     sweep.max_requests = max_requests;
 
+    // Names we refuse to lose to sampling.
+    //
+    // Valve's master list returns an arbitrary 10,000 rows per query, so a server in a crowded bucket
+    // can appear in one sweep and vanish from the next — which is exactly what happened to
+    // `[STPC] Sakhal`: the master had it, the sweep's sample did not. Asking for a community by name is
+    // deterministic and costs one request each, so the known servers are always in the index.
+    let watchlist: Vec<String> = std::env::var("VAPOUR_WATCHLIST")
+        .unwrap_or_else(|_| "[STPC,[SCUK,DayOne,Karmakrew,DownBad".to_string())
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    let mut watched: Vec<GameServer> = Vec::new();
+    for prefix in &watchlist {
+        let filter = format!("\\appid\\221100\\name_match\\{prefix}*");
+        match sweep.fetch_named(&filter).await {
+            Some(rows) => {
+                println!("watchlist  : {prefix:<10} {} servers", rows.len());
+                watched.extend(rows);
+            }
+            None => println!("watchlist  : {prefix:<10} unreadable this run"),
+        }
+    }
+    println!("watchlist  : {} servers in total", watched.len());
     let found = match sweep.run().await {
         Ok(found) => found,
         Err(error) => {
@@ -464,7 +489,26 @@ async fn main() {
     // Carry forward what the last run published. A bucket that failed this time must not delete the
     // servers it found last time, so the index is a union and coverage only grows.
     let relay = std::env::var("VAPOUR_RELAY").unwrap_or_else(|_| DEFAULT_RELAY.to_string());
+
     let mut merged: Vec<GameServer> = found.servers.clone();
+
+    // Watchlist rows were read this run, by name, so they go in before the carried ones: they are
+    // fresher than last run's copy and authoritative about existing.
+    {
+        let mut seen: std::collections::HashSet<String> =
+            merged.iter().map(|s| s.addr.clone()).collect();
+        let before = merged.len();
+        for server in &watched {
+            if seen.insert(server.addr.clone()) {
+                merged.push(server.clone());
+            }
+        }
+        println!(
+            "watchlist  : {} of {} not already found by the ladder",
+            merged.len() - before,
+            watched.len()
+        );
+    }
     let carried = match load_previous(&relay).await {
         Some(previous) => {
             let mut seen: std::collections::HashSet<String> =
@@ -487,6 +531,8 @@ async fn main() {
             0
         }
     };
+
+
 
     // What the servers said about themselves the last time they were asked. Absent, ancient or
     // unreadable all mean the same thing: no verdicts, and therefore no deletions on their account.
