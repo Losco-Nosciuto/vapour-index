@@ -657,11 +657,11 @@ async fn main() {
         });
     }
 
-    // Keep the best instance of each name, and count the rest as collapsed rather than dropped.
+    // Keep the best instance of each identity — name and map — and count the rest as collapsed.
     let ranked_total = servers.len();
     let mut best: std::collections::HashMap<String, Ranked> = std::collections::HashMap::new();
     for candidate in servers {
-        let key = cluster::name_key(&candidate.published.server);
+        let key = cluster::row_key(&candidate.published.server);
         match best.get(&key) {
             Some(existing)
                 if (existing.rank, existing.queue, existing.players)
@@ -671,7 +671,7 @@ async fn main() {
             }
         }
     }
-    let by_name = ranked_total - best.len();
+    let collapsed = ranked_total - best.len();
     let mut servers: Vec<Published> = Vec::with_capacity(best.len());
     for (_, candidate) in best {
         servers.push(candidate.published);
@@ -713,7 +713,7 @@ async fn main() {
         );
     }
     println!("published  : {} of {} listings", servers.len(), merged.len());
-    println!("collapsed  : {by_name} instances of a name already shown (one row per name ships)");
+    println!("collapsed  : {collapsed} instances of the same name and map already shown (one row per name and map ships)");
     println!(
         "names      : {} seen, {} published, {} never published",
         names.len(),

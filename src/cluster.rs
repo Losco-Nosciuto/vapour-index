@@ -266,15 +266,26 @@ impl ClusterIndex {
     }
 }
 
-/// The identity of a server for the purposes of collapsing copies: its name.
+/// The identity of a server for the purposes of collapsing copies: its name **and its map**.
 ///
-/// Keying on (machine, name) was wrong for the real shape of the flood. A copy is the same name on a
-/// *different* machine, so that key left eighteen rows of "DayOne Nasdara 1PP" and twenty of "KarmaKrew
-/// Nasdara #4" in the list — exactly the crowding the other launchers do not have. They publish one row
-/// per name, and so do we. Which instance is shown is decided by evidence in the producer: a queue
-/// first, then a named population, then the busiest.
-pub fn name_key(server: &GameServer) -> String {
-    server.name.trim().to_lowercase()
+/// Keying on the name alone was wrong, and wrong in a way that cost servers. A copy is the same name on
+/// a *different* address, so the name does collapse the eighteen rows of "DayOne Nasdara 1PP" into one —
+/// but it also collapses a community running the same name on Chernarus, Livonia and Sakhal into a single
+/// row. In DayZ you cannot travel between maps: each one is a separate destination, so the other two
+/// become unreachable from the launcher rather than merely hidden.
+///
+/// Measured 25/10/2026 against 91,500 A2S readings: 8,810 of 35,417 names appear on more than one map,
+/// 9,306 variants beyond the first. Keying on (name, map) recovers those and still collapses the farm
+/// copies, which share both.
+///
+/// The separator is a unit separator, which no name or map can contain, so a name cannot be crafted to
+/// end where another map begins.
+pub fn row_key(server: &GameServer) -> String {
+    format!(
+        "{}\u{1f}{}",
+        server.name.trim().to_lowercase(),
+        server.map.trim().to_lowercase()
+    )
 }
 
 #[cfg(test)]
@@ -294,6 +305,16 @@ mod tests {
         GameServer {
             addr: addr.to_string(),
             name: name.to_string(),
+            max_players: 60,
+            ..Default::default()
+        }
+    }
+
+    fn server_on(addr: &str, name: &str, map: &str) -> GameServer {
+        GameServer {
+            addr: addr.to_string(),
+            name: name.to_string(),
+            map: map.to_string(),
             max_players: 60,
             ..Default::default()
         }
@@ -384,34 +405,73 @@ mod tests {
     }
 
     #[test]
-    fn one_row_per_name_is_what_ships() {
+    fn one_row_per_name_and_map_is_what_ships() {
         use std::collections::HashSet;
 
-        // A farm: three names, each announced on hundreds of ports across several machines. Keying on the
-        // name keeps one row per name, so 1,200 rows become 3 without erasing anything — and, crucially,
-        // it collapses the copies that sit on *different* machines, which the old key could not.
+        // A farm: three names on one map, each announced on hundreds of ports across several machines.
+        // Keying on (name, map) still takes 1,200 rows down to 3 — the copies share both halves.
         let mut servers = Vec::new();
         for machine in 0..4 {
             for port in 0..100 {
                 for (offset, name) in [(2000, "Farm A"), (6000, "Farm B"), (10000, "Farm C")] {
-                    servers.push(server(
+                    servers.push(server_on(
                         &format!("9.9.{machine}.9:{}", offset + port),
                         name,
+                        "chernarusplus",
                     ));
                 }
             }
         }
-        let kept: HashSet<String> = servers.iter().map(name_key).collect();
-        assert_eq!(kept.len(), 3);
+        let kept: HashSet<String> = servers.iter().map(row_key).collect();
+        assert_eq!(kept.len(), 3, "copies on other machines still collapse");
         assert_eq!(servers.len(), 1200);
 
         // And a community's fifty-three differently-named servers survive as fifty-three rows, wherever
-        // they run: nothing about running many servers is itself a reason to collapse anything.
+        // they run: running many servers is not itself a reason to collapse anything.
         let community: Vec<GameServer> = (0..53)
-            .map(|i| server(&format!("185.83.152.170:{}", 2303 + i), &format!("[STPC] Server {i}")))
+            .map(|i| {
+                server_on(
+                    &format!("185.83.152.170:{}", 2303 + i),
+                    &format!("[STPC] Server {i}"),
+                    "chernarusplus",
+                )
+            })
             .collect();
-        let community_keys: HashSet<String> = community.iter().map(name_key).collect();
+        let community_keys: HashSet<String> = community.iter().map(row_key).collect();
         assert_eq!(community_keys.len(), 53);
+    }
+
+    #[test]
+    fn the_same_name_on_three_maps_is_three_rows() {
+        use std::collections::HashSet;
+
+        // The bug this key exists for. A community runs one name on three maps; in DayZ you cannot walk
+        // from one to another, so collapsing to one row hides two servers rather than a copy.
+        let servers: Vec<GameServer> = ["chernarusplus", "livonia", "sakhal"]
+            .iter()
+            .flat_map(|map| {
+                (0..20).map(move |i| {
+                    server_on(
+                        &format!("185.83.152.{}:2302", 10 + i),
+                        "Community A | Survival",
+                        map,
+                    )
+                })
+            })
+            .collect();
+
+        let keys: HashSet<String> = servers.iter().map(row_key).collect();
+        assert_eq!(keys.len(), 3, "one row per map, not one row per name");
+    }
+
+    #[test]
+    fn the_key_ignores_case_and_padding_but_not_the_map() {
+        let a = server_on("1.2.3.4:2302", " Farm A ", "ChernarusPlus");
+        let b = server_on("5.6.7.8:2302", "farm a", "chernarusplus");
+        let c = server_on("9.9.9.9:2302", "Farm A", "livonia");
+
+        assert_eq!(row_key(&a), row_key(&b), "case and padding must not split one row");
+        assert_ne!(row_key(&a), row_key(&c), "a different map is a different destination");
     }
 
     #[test]
