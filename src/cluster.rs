@@ -266,6 +266,37 @@ impl ClusterIndex {
     }
 }
 
+/// The map a server's own name advertises, when it names one.
+///
+/// Only common maps are listed. A name that mentions none falls back to the reported map — the previous
+/// behaviour — and so does a name mentioning an unknown community map, so this table can grow without
+/// making anything fragile.
+fn advertised_map(name: &str) -> Option<&'static str> {
+    const ALIASES: &[(&str, &str)] = &[
+        ("chernarus", "chernarusplus"),
+        ("cherno", "chernarusplus"),
+        ("livonia", "enoch"),
+        ("enoch", "enoch"),
+        ("namalsk", "namalsk"),
+        ("sakhal", "sakhal"),
+        ("nasdara", "nasdara"),
+        ("alteria", "alteria"),
+        ("krasna", "krasna"),
+        ("deer isle", "deerisle"),
+        ("deerisle", "deerisle"),
+        ("esseker", "esseker"),
+        ("banov", "banov"),
+        ("takistan", "takistanplus"),
+        ("melkart", "melkart"),
+        ("nyheim", "nyheim"),
+    ];
+    let lower = name.to_lowercase();
+    ALIASES
+        .iter()
+        .find(|(needle, _)| lower.contains(needle))
+        .map(|(_, map)| *map)
+}
+
 /// The identity of a server for the purposes of collapsing copies: its name **and its map**.
 ///
 /// Keying on the name alone was wrong, and wrong in a way that cost servers. A copy is the same name on
@@ -274,17 +305,26 @@ impl ClusterIndex {
 /// row. In DayZ you cannot travel between maps: each one is a separate destination, so the other two
 /// become unreachable from the launcher rather than merely hidden.
 ///
-/// Measured 25/10/2026 against 91,500 A2S readings: 8,810 of 35,417 names appear on more than one map,
-/// 9,306 variants beyond the first. Keying on (name, map) recovers those and still collapses the farm
-/// copies, which share both.
+/// Keying on `(name, reported map)` then over-corrected: a clone advertising "KarmaKrew Sakhal" while
+/// running Chernarus became a row of its own, and a name that already carries its map is not ambiguous —
+/// the map is part of the identity the server publishes. Measured 5/11/2026: KarmaKrew went from 67
+/// distinct names to 159 rows, 105 of which contradicted their own name.
+///
+/// So the rule is: **if the name advertises a map, that is the identity; otherwise the reported map is.**
+/// A community whose servers are all called "Community A | Survival" still gets one row per map, which is
+/// what the previous fix was for.
 ///
 /// The separator is a unit separator, which no name or map can contain, so a name cannot be crafted to
 /// end where another map begins.
 pub fn row_key(server: &GameServer) -> String {
+    let identity_map = match advertised_map(&server.name) {
+        Some(map) => map.to_string(),
+        None => server.map.trim().to_lowercase(),
+    };
     format!(
         "{}\u{1f}{}",
         server.name.trim().to_lowercase(),
-        server.map.trim().to_lowercase()
+        identity_map
     )
 }
 
@@ -472,6 +512,44 @@ mod tests {
 
         assert_eq!(row_key(&a), row_key(&b), "case and padding must not split one row");
         assert_ne!(row_key(&a), row_key(&c), "a different map is a different destination");
+    }
+
+    #[test]
+    fn a_name_that_advertises_a_map_has_one_identity() {
+        // A clone advertising KarmaKrew Sakhal while running three different maps. The name already
+        // says where it claims to be, so the reported map must not multiply it into three rows.
+        let rows: Vec<GameServer> = ["sakhal", "chernarusplus", "namalsk"]
+            .iter()
+            .enumerate()
+            .map(|(i, map)| {
+                server_on(
+                    &format!("10.0.0.{}:2302", i),
+                    "KarmaKrew Sakhal EU - 1PP",
+                    map,
+                )
+            })
+            .collect();
+
+        let keys: std::collections::HashSet<String> = rows.iter().map(row_key).collect();
+        assert_eq!(keys.len(), 1, "the advertised map is the identity");
+    }
+
+    #[test]
+    fn a_name_without_a_map_still_splits_per_reported_map() {
+        let rows: Vec<GameServer> = ["chernarusplus", "livonia", "sakhal"]
+            .iter()
+            .enumerate()
+            .map(|(i, map)| {
+                server_on(
+                    &format!("10.1.0.{}:2302", i),
+                    "Community A | Survival",
+                    map,
+                )
+            })
+            .collect();
+
+        let keys: std::collections::HashSet<String> = rows.iter().map(row_key).collect();
+        assert_eq!(keys.len(), 3, "three maps remain three destinations");
     }
 
     #[test]
