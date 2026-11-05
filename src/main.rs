@@ -27,7 +27,7 @@ use steam::{Enumerated, GameServer, Sweep, Transport};
 const DEFAULT_RELAY: &str = "https://dayz-vapour-relay.chrisplayer.workers.dev";
 
 /// One row as published: the server, and the verdict that follows it.
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct Published {
     server: GameServer,
     verdict: Verdict,
@@ -51,6 +51,10 @@ struct Counts {
     hidden: usize,
     /// Carried over from earlier runs because this one could not read their buckets again.
     carried: usize,
+    /// Rows removed because their address publishes more than `MAX_ROWS_PER_HOST` rows.
+    capped: usize,
+    /// How many addresses those rows came from.
+    fleet_hosts: usize,
 }
 
 /// One hidden row, written to a diagnostic file.
@@ -79,6 +83,54 @@ struct Ranked {
     queue: u16,
     players: u8,
     published: Published,
+}
+
+/// An address publishing more than this many distinct rows is a fleet, not a host.
+///
+/// Measured 6/11/2026 on 95,081 published rows: **11 addresses exceeded it and carried 19,309 rows**, a
+/// fifth of the list, with no community among them. No community runs a thousand servers on one IP; those
+/// rows exist to catch searches. The cut is deliberately the safe one — it removes the tail that cannot
+/// be legitimate, and leaves the ambiguous middle (51-200 rows per host) for a later, measured decision.
+const MAX_ROWS_PER_HOST: usize = 1000;
+
+/// The address without the query port. `ip:port` is the server; `ip` is the machine.
+fn host_of(addr: &str) -> &str {
+    addr.split(':').next().unwrap_or(addr)
+}
+
+/// Hosts with more than `max` rows in the given set.
+fn hosts_above<'a>(
+    addrs: impl Iterator<Item = &'a str>,
+    max: usize,
+) -> std::collections::HashSet<String> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for addr in addrs {
+        *counts.entry(host_of(addr)).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count > max)
+        .map(|(host, _)| host.to_string())
+        .collect()
+}
+
+/// The best instance of each identity, by queue first, then a named population, then the busiest.
+fn pick_best<'a>(
+    candidates: impl Iterator<Item = &'a Ranked>,
+) -> std::collections::HashMap<String, &'a Ranked> {
+    let mut best: std::collections::HashMap<String, &'a Ranked> = std::collections::HashMap::new();
+    for candidate in candidates {
+        let key = cluster::row_key(&candidate.published.server);
+        match best.get(&key) {
+            Some(existing)
+                if (existing.rank, existing.queue, existing.players)
+                    >= (candidate.rank, candidate.queue, candidate.players) => {}
+            _ => {
+                best.insert(key, candidate);
+            }
+        }
+    }
+    best
 }
 
 /// The published list, as read back for the A2S pass.
@@ -657,25 +709,29 @@ async fn main() {
         });
     }
 
-    // Keep the best instance of each identity — name and map — and count the rest as collapsed.
+    // Two passes. The first finds which addresses are fleets; the second lets only real hosts compete
+    // for an identity. Doing it the other way round would let a clone win a name and then have the
+    // fleet cap delete the winner, losing the name entirely.
     let ranked_total = servers.len();
-    let mut best: std::collections::HashMap<String, Ranked> = std::collections::HashMap::new();
-    for candidate in servers {
-        let key = cluster::row_key(&candidate.published.server);
-        match best.get(&key) {
-            Some(existing)
-                if (existing.rank, existing.queue, existing.players)
-                    >= (candidate.rank, candidate.queue, candidate.players) => {}
-            _ => {
-                best.insert(key, candidate);
-            }
-        }
-    }
-    let collapsed = ranked_total - best.len();
-    let mut servers: Vec<Published> = Vec::with_capacity(best.len());
-    for (_, candidate) in best {
-        servers.push(candidate.published);
-    }
+    let first = pick_best(servers.iter());
+    let fleets = hosts_above(
+        first.values().map(|ranked| ranked.published.server.addr.as_str()),
+        MAX_ROWS_PER_HOST,
+    );
+    let fleet_hosts = fleets.len();
+    let fleet_rows = first.len();
+    let best = pick_best(
+        servers
+            .iter()
+            .filter(|ranked| !fleets.contains(host_of(&ranked.published.server.addr))),
+    );
+
+    let collapsed = ranked_total - fleet_rows;
+    let capped = fleet_rows - best.len();
+    let servers: Vec<Published> = best
+        .into_values()
+        .map(|ranked| ranked.published.clone())
+        .collect();
 
     let names: std::collections::HashSet<&str> =
         merged.iter().map(|s| s.name.as_str()).collect();
@@ -714,6 +770,7 @@ async fn main() {
     }
     println!("published  : {} of {} listings", servers.len(), merged.len());
     println!("collapsed  : {collapsed} instances of the same name and map already shown (one row per name and map ships)");
+    println!("capped     : {capped} rows on {fleet_hosts} hosts publishing more than {MAX_ROWS_PER_HOST} rows");
     println!(
         "names      : {} seen, {} published, {} never published",
         names.len(),
@@ -800,6 +857,8 @@ async fn main() {
                 suspected,
                 hidden,
                 carried,
+                capped,
+                fleet_hosts,
             },
             servers,
         };
@@ -948,6 +1007,32 @@ fn report(found: &Enumerated, thresholds: cluster::Thresholds) {
     clusters.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     if let Some((ip, count)) = clusters.first() {
         println!("largest host  : {ip} with {count} listings");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_host_is_the_address_without_the_port() {
+        assert_eq!(host_of("203.0.113.7:2302"), "203.0.113.7");
+        assert_eq!(host_of("no-port"), "no-port");
+    }
+
+    #[test]
+    fn hosts_are_counted_per_machine_not_per_port() {
+        let addrs = [
+            "1.1.1.1:2302",
+            "1.1.1.1:2402",
+            "1.1.1.1:2502",
+            "2.2.2.2:2302",
+            "3.3.3.3:2302",
+        ];
+        let fleets = hosts_above(addrs.iter().copied(), 2);
+        assert!(fleets.contains("1.1.1.1"), "three rows on one machine pass a limit of two");
+        assert!(!fleets.contains("2.2.2.2"));
+        assert_eq!(fleets.len(), 1);
     }
 }
 
